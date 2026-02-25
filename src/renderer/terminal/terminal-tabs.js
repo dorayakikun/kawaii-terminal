@@ -14,6 +14,7 @@ const TAB_ATTACH_VERTICAL_THRESHOLD = 24;
 const TAB_DETACH_VERTICAL_THRESHOLD = 52;
 const TAB_DETACH_HORIZONTAL_THRESHOLD = 60;
 const TAB_DETACH_HORIZONTAL_HYSTERESIS = 12;
+const TAB_SPRING_LOAD_DELAY_MS = 300;
 const MAX_PANES = 4;
 const MIN_PANE_WIDTH = 220;
 const MIN_PANE_HEIGHT = 140;
@@ -199,6 +200,13 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     pointerId: null,
     suppressClick: false,
     moveRaf: null,
+    sourceActiveTabId: null,
+    springHoverTabId: null,
+    springHoverTimer: null,
+    paneDropTarget: null,
+    paneDropOverlayEl: null,
+    mergeInProgress: false,
+    mergeCommitted: false,
   };
 
   const updateTabsLayout = () => {
@@ -218,6 +226,32 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   dragGhost.innerHTML = '<span class="tab-drag-ghost-dot"></span><span class="tab-drag-ghost-title"></span>';
   document.body.appendChild(dragGhost);
   dragState.ghostEl = dragGhost;
+
+  const paneDropOverlay = document.createElement('div');
+  paneDropOverlay.className = 'tab-pane-drop-overlay';
+  document.body.appendChild(paneDropOverlay);
+  dragState.paneDropOverlayEl = paneDropOverlay;
+
+  const hideTabPaneDropOverlay = () => {
+    dragState.paneDropTarget = null;
+    dragState.paneDropOverlayEl?.classList.remove('show', 'is-left', 'is-right', 'is-top', 'is-bottom', 'is-invalid');
+  };
+
+  const showTabPaneDropOverlay = (rect, direction, { valid = true } = {}) => {
+    const el = dragState.paneDropOverlayEl;
+    if (!el || !rect) return;
+    el.style.left = `${Math.round(rect.left)}px`;
+    el.style.top = `${Math.round(rect.top)}px`;
+    el.style.width = `${Math.round(rect.width)}px`;
+    el.style.height = `${Math.round(rect.height)}px`;
+    el.classList.remove('is-left', 'is-right', 'is-top', 'is-bottom', 'is-invalid');
+    if (direction === 'left') el.classList.add('is-left');
+    if (direction === 'right') el.classList.add('is-right');
+    if (direction === 'top') el.classList.add('is-top');
+    if (direction === 'bottom') el.classList.add('is-bottom');
+    if (!valid || !direction) el.classList.add('is-invalid');
+    el.classList.add('show');
+  };
 
   // スクロールボタンのクリックイベント
   scrollLeftBtn?.addEventListener('click', () => {
@@ -264,7 +298,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     const tab = tabs.get(activeTabId);
     if (!tab) return null;
     const pane = tab.panes.get(tab.activePaneId);
-    return pane?.terminalManager || null;
+    return isTerminalPane(pane) ? (pane?.terminalManager || null) : null;
   };
 
   const normalizeBrowserUrl = (value, { allowBlank = true, allowProtocolLess = true } = {}) => {
@@ -305,24 +339,37 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
   const getBrowserTabTransferUrl = (tab) => {
     if (!tab || tab.type !== 'browser') return 'about:blank';
+    return getBrowserStateTransferUrl(tab.browser);
+  };
+
+  const getBrowserStateTransferUrl = (browserState) => {
+    if (!browserState) return 'about:blank';
     let candidate = '';
     try {
-      if (typeof tab.browser?.webviewEl?.getURL === 'function') {
-        candidate = String(tab.browser.webviewEl.getURL() || '').trim();
+      if (typeof browserState?.webviewEl?.getURL === 'function') {
+        candidate = String(browserState.webviewEl.getURL() || '').trim();
       }
     } catch (_) {
       candidate = '';
     }
     if (!candidate) {
-      candidate = String(tab.browser?.requestedUrl || '').trim();
+      candidate = String(browserState?.requestedUrl || '').trim();
     }
     if (!candidate) {
-      candidate = String(tab.browser?.url || '').trim();
+      candidate = String(browserState?.url || '').trim();
     }
     if (!candidate) {
-      candidate = String(tab.browser?.urlInputEl?.value || '').trim();
+      candidate = String(browserState?.urlInputEl?.value || '').trim();
     }
     return normalizeBrowserUrl(candidate, { allowBlank: true, allowProtocolLess: true }) || 'about:blank';
+  };
+
+  const isTerminalPane = (pane) => pane?.kind !== 'browser';
+  const isBrowserPane = (pane) => pane?.kind === 'browser';
+
+  const getBrowserPaneTransferUrl = (pane) => {
+    if (!isBrowserPane(pane)) return 'about:blank';
+    return getBrowserStateTransferUrl(pane.browser);
   };
 
   const applyBrowserTabAutoTitle = (tab, { pageTitle, url } = {}) => {
@@ -546,6 +593,321 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       loadBrowserUrlInTab(tab, initialUrl, { allowBlank: true });
     }
     return browserState;
+  };
+
+  const destroyBrowserSurface = (browserState) => {
+    if (!browserState) return;
+    try {
+      browserState.webviewEl?.remove?.();
+    } catch (_) { /* noop */ }
+    try {
+      browserState.root?.remove?.();
+    } catch (_) { /* noop */ }
+  };
+
+  const updateBrowserPaneTabTitle = (tab, pane, { pageTitle, url } = {}) => {
+    if (!tab || !pane) return;
+    const nextTitle = String(pageTitle || '').trim() || getBrowserTitleFromUrl(url || getBrowserPaneTransferUrl(pane));
+    pane.autoTitle = nextTitle || 'Browser';
+    if (pane.titleEl) {
+      pane.titleEl.textContent = pane.autoTitle;
+    }
+    historyManager?.updatePaneLabel?.(pane.paneId, pane.autoTitle);
+    if (tab.activePaneId === pane.paneId && !tab.customTitle) {
+      tab.autoTitle = pane.autoTitle;
+      tab.titleEl.textContent = pane.autoTitle;
+      historyManager?.setActiveTabLabel?.(pane.autoTitle);
+    }
+  };
+
+  const setBrowserPaneStatus = (pane, message, tone = '') => {
+    const statusEl = pane?.browser?.statusEl;
+    if (!statusEl) return;
+    const text = String(message || '').trim();
+    statusEl.textContent = text;
+    statusEl.classList.toggle('show', Boolean(text));
+    statusEl.classList.toggle('error', tone === 'error');
+  };
+
+  const loadBrowserUrlInPane = (tab, pane, value, { allowBlank = true } = {}) => {
+    if (!tab || !isBrowserPane(pane) || !pane.browser?.webviewEl) return { ok: false, reason: 'not-browser-pane' };
+    const normalized = normalizeBrowserUrl(value, { allowBlank, allowProtocolLess: true });
+    if (!normalized) {
+      setBrowserPaneStatus(pane, 'Invalid URL (HTTP/HTTPS only).', 'error');
+      return { ok: false, reason: 'invalid-url' };
+    }
+    pane.browser.url = normalized;
+    pane.browser.requestedUrl = normalized;
+    pane.browser.urlInputEl.value = normalized === 'about:blank' ? '' : normalized;
+    setBrowserPaneStatus(pane, '');
+    updateBrowserPaneTabTitle(tab, pane, { url: normalized });
+    try {
+      pane.browser.webviewEl.src = normalized;
+      return { ok: true, url: normalized };
+    } catch (error) {
+      setBrowserPaneStatus(pane, 'Failed to load URL.', 'error');
+      return { ok: false, reason: 'load-failed', error };
+    }
+  };
+
+  const reloadBrowserPane = (pane) => {
+    if (!isBrowserPane(pane)) return false;
+    const webviewEl = pane.browser?.webviewEl;
+    if (!webviewEl) return false;
+    try {
+      if (!pane.browser.url || pane.browser.url === 'about:blank') {
+        webviewEl.src = 'about:blank';
+      } else if (typeof webviewEl.reload === 'function') {
+        webviewEl.reload();
+      } else {
+        webviewEl.src = pane.browser.url;
+      }
+      setBrowserPaneStatus(pane, '');
+      return true;
+    } catch (_) {
+      setBrowserPaneStatus(pane, 'Reload failed.', 'error');
+      return false;
+    }
+  };
+
+  const createBrowserPane = (tab, options = {}) => {
+    const {
+      paneId: providedId,
+      title,
+      browser: browserPayload = null,
+    } = options;
+    const paneId = (providedId && !tab.panes.has(providedId))
+      ? providedId
+      : createPaneId(tab);
+    const initialUrl = normalizeBrowserUrl(browserPayload?.url, { allowBlank: true, allowProtocolLess: true }) || 'about:blank';
+
+    const paneEl = document.createElement('div');
+    paneEl.className = 'terminal-pane browser-pane';
+    paneEl.dataset.paneId = paneId;
+
+    const headerEl = document.createElement('div');
+    headerEl.className = 'terminal-pane-header';
+    const titleEl = document.createElement('span');
+    titleEl.className = 'terminal-pane-title';
+    titleEl.textContent = title || 'Browser';
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'terminal-pane-close';
+    closeBtn.textContent = '×';
+    closeBtn.title = 'Close pane';
+    headerEl.appendChild(titleEl);
+    headerEl.appendChild(closeBtn);
+    paneEl.appendChild(headerEl);
+
+    const summaryEl = document.createElement('div');
+    summaryEl.className = 'terminal-pane-summary is-empty';
+    paneEl.appendChild(summaryEl);
+
+    const contentEl = document.createElement('div');
+    contentEl.className = 'terminal-pane-content browser-pane-content';
+    paneEl.appendChild(contentEl);
+
+    const toastEl = document.createElement('div');
+    toastEl.className = 'terminal-toast';
+    paneEl.appendChild(toastEl);
+
+    const root = document.createElement('div');
+    root.className = 'browser-tab-root';
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'browser-tab-toolbar';
+
+    const urlInputEl = document.createElement('input');
+    urlInputEl.className = 'browser-tab-url-input';
+    urlInputEl.type = 'text';
+    urlInputEl.placeholder = 'Enter URL (https://...)';
+    urlInputEl.spellcheck = false;
+    urlInputEl.autocomplete = 'off';
+
+    const goBtn = document.createElement('button');
+    goBtn.className = 'browser-tab-btn';
+    goBtn.type = 'button';
+    goBtn.textContent = 'Go';
+
+    const reloadBtn = document.createElement('button');
+    reloadBtn.className = 'browser-tab-btn';
+    reloadBtn.type = 'button';
+    reloadBtn.textContent = 'Reload';
+
+    const statusEl = document.createElement('div');
+    statusEl.className = 'browser-tab-status';
+
+    const body = document.createElement('div');
+    body.className = 'browser-tab-body';
+
+    const webviewEl = document.createElement('webview');
+    webviewEl.className = 'browser-tab-webview';
+    webviewEl.setAttribute('partition', 'persist:kawaii-terminal-browser');
+
+    body.appendChild(webviewEl);
+    toolbar.appendChild(urlInputEl);
+    toolbar.appendChild(goBtn);
+    toolbar.appendChild(reloadBtn);
+    toolbar.appendChild(statusEl);
+    root.appendChild(toolbar);
+    root.appendChild(body);
+    contentEl.appendChild(root);
+
+    const pane = {
+      kind: 'browser',
+      paneId,
+      paneEl,
+      headerEl,
+      titleEl,
+      closeBtn,
+      contentEl,
+      terminalManager: null,
+      floatActionsEl: null,
+      copyOutputBtn: null,
+      pinBtn: null,
+      toastEl,
+      toastTimer: null,
+      summaryEl,
+      autoTitle: title || 'Browser',
+      lastCwd: null,
+      tabId: tab.tabId,
+      sessionSnapshotDirty: false,
+      sessionSnapshotHash: '',
+      imagePreviewDisposable: null,
+      mdPreviewDisposable: null,
+      profileId: null,
+      browser: {
+        root,
+        toolbar,
+        body,
+        webviewEl,
+        urlInputEl,
+        goBtn,
+        reloadBtn,
+        statusEl,
+        url: initialUrl,
+        requestedUrl: initialUrl,
+        pageTitle: '',
+        loading: false,
+      },
+    };
+
+    const commitInputUrl = () => {
+      const result = loadBrowserUrlInPane(tab, pane, urlInputEl.value, { allowBlank: true });
+      return result.ok;
+    };
+
+    urlInputEl.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      commitInputUrl();
+    });
+    urlInputEl.addEventListener('focus', () => {
+      urlInputEl.select();
+    });
+    goBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      commitInputUrl();
+    });
+    reloadBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      reloadBrowserPane(pane);
+    });
+
+    webviewEl.addEventListener('did-start-loading', () => {
+      pane.browser.loading = true;
+      setBrowserPaneStatus(pane, 'Loading...');
+    });
+    webviewEl.addEventListener('did-stop-loading', () => {
+      pane.browser.loading = false;
+      try {
+        const currentUrl = normalizeBrowserUrl(webviewEl.getURL?.(), { allowBlank: true, allowProtocolLess: false });
+        if (currentUrl) {
+          const preferRequested = currentUrl === 'about:blank'
+            && pane.browser.requestedUrl
+            && pane.browser.requestedUrl !== 'about:blank';
+          const effectiveUrl = preferRequested ? pane.browser.requestedUrl : currentUrl;
+          pane.browser.url = effectiveUrl;
+          urlInputEl.value = effectiveUrl === 'about:blank' ? '' : effectiveUrl;
+          updateBrowserPaneTabTitle(tab, pane, { pageTitle: pane.browser.pageTitle, url: effectiveUrl });
+        }
+      } catch (_) { /* noop */ }
+      setBrowserPaneStatus(pane, '');
+    });
+    webviewEl.addEventListener('did-fail-load', (event) => {
+      if (Number(event?.errorCode) === -3) return;
+      pane.browser.loading = false;
+      const msg = String(event?.errorDescription || 'Page load failed').trim();
+      setBrowserPaneStatus(pane, msg, 'error');
+    });
+    webviewEl.addEventListener('did-navigate', (event) => {
+      const nextUrl = typeof event?.url === 'string' ? event.url : '';
+      const normalized = normalizeBrowserUrl(nextUrl, { allowBlank: true, allowProtocolLess: false });
+      if (!normalized) return;
+      pane.browser.url = normalized;
+      if (normalized !== 'about:blank' || pane.browser.requestedUrl === 'about:blank') {
+        pane.browser.requestedUrl = normalized;
+      }
+      urlInputEl.value = normalized === 'about:blank' ? '' : normalized;
+      updateBrowserPaneTabTitle(tab, pane, { pageTitle: pane.browser.pageTitle, url: normalized });
+    });
+    webviewEl.addEventListener('did-navigate-in-page', (event) => {
+      const nextUrl = typeof event?.url === 'string' ? event.url : '';
+      const normalized = normalizeBrowserUrl(nextUrl, { allowBlank: true, allowProtocolLess: false });
+      if (!normalized) return;
+      pane.browser.url = normalized;
+      if (normalized !== 'about:blank' || pane.browser.requestedUrl === 'about:blank') {
+        pane.browser.requestedUrl = normalized;
+      }
+      urlInputEl.value = normalized === 'about:blank' ? '' : normalized;
+      updateBrowserPaneTabTitle(tab, pane, { pageTitle: pane.browser.pageTitle, url: normalized });
+    });
+    webviewEl.addEventListener('page-title-updated', (event) => {
+      const titleText = String(event?.title || '').trim();
+      pane.browser.pageTitle = titleText;
+      updateBrowserPaneTabTitle(tab, pane, { pageTitle: titleText, url: pane.browser.url });
+    });
+    webviewEl.addEventListener('new-window', (event) => {
+      event.preventDefault?.();
+      const targetUrl = typeof event?.url === 'string' ? event.url : '';
+      const normalized = normalizeBrowserUrl(targetUrl, { allowBlank: false, allowProtocolLess: false });
+      if (normalized) {
+        void openUrlInBrowserTab(normalized, { activate: true });
+      }
+    });
+
+    const activateBrowserPaneFromGuest = () => {
+      if (tab.activePaneId === paneId) return;
+      setActivePane(tab, paneId);
+    };
+    webviewEl.addEventListener('focus', activateBrowserPaneFromGuest);
+    webviewEl.addEventListener('mousedown', activateBrowserPaneFromGuest);
+    webviewEl.addEventListener('mouseup', activateBrowserPaneFromGuest);
+    webviewEl.addEventListener('mouseenter', activateBrowserPaneFromGuest);
+
+    paneEl.addEventListener('pointerdown', () => {
+      if (tab.activePaneId !== paneId) {
+        setActivePane(tab, paneId);
+      }
+    });
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closePane(tab, paneId);
+    });
+
+    tab.panes.set(paneId, pane);
+    historyManager?.updatePaneLabel?.(paneId, titleEl.textContent || 'Browser');
+    updateBrowserPaneTabTitle(tab, pane, { url: initialUrl });
+    if (initialUrl !== 'about:blank') {
+      loadBrowserUrlInPane(tab, pane, initialUrl, { allowBlank: true });
+    }
+    updateTabWslIndicator(tab);
+    syncTabStatusIndicator(tab);
+    return pane;
+  };
+
+  const destroyBrowserPane = (pane) => {
+    if (!pane) return;
+    destroyBrowserSurface(pane.browser);
   };
 
   const resolvePaneProfileId = (pane, tab) => {
@@ -1005,6 +1367,18 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       };
     }
     const panes = Array.from(tab.panes.values()).map((pane) => {
+      if (isBrowserPane(pane)) {
+        return {
+          kind: 'browser',
+          paneId: pane.paneId,
+          title: pane.autoTitle || title || 'Browser',
+          snapshot: '',
+          profileId: null,
+          browser: {
+            url: getBrowserPaneTransferUrl(pane),
+          },
+        };
+      }
       let paneSnapshot = '';
       try {
         paneSnapshot = pane.terminalManager?.getScreenContent?.() || '';
@@ -1012,12 +1386,13 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       if (paneSnapshot.length > TAB_DRAG_SNAPSHOT_MAX) {
         paneSnapshot = paneSnapshot.slice(-TAB_DRAG_SNAPSHOT_MAX);
       }
-        return {
-          paneId: pane.paneId,
-          title: pane.autoTitle || title,
-          snapshot: paneSnapshot,
-          profileId: pane.profileId || pane.terminalManager?.profileId || null,
-        };
+      return {
+        kind: 'terminal',
+        paneId: pane.paneId,
+        title: pane.autoTitle || title,
+        snapshot: paneSnapshot,
+        profileId: pane.profileId || pane.terminalManager?.profileId || null,
+      };
     });
     let snapshot = '';
     const activePane = tab.panes.get(tab.activePaneId);
@@ -1037,15 +1412,353 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     };
   };
 
+  const normalizeTabPayloadForPaneMerge = (payload) => {
+    if (!payload?.tabId) return null;
+    if (payload.type === 'browser') {
+      const paneId = `pane-${payload.tabId}-browser`;
+      return {
+        ...payload,
+        type: 'terminal',
+        splitLayout: { type: 'pane', paneId },
+        activePaneId: paneId,
+        panes: [{
+          kind: 'browser',
+          paneId,
+          title: payload.title || 'Browser',
+          snapshot: '',
+          profileId: null,
+          browser: {
+            url: payload?.browser?.url || 'about:blank',
+          },
+        }],
+      };
+    }
+    const panes = Array.isArray(payload.panes) ? payload.panes : [];
+    return {
+      ...payload,
+      type: 'terminal',
+      panes: panes.map((pane) => ({
+        ...pane,
+        kind: pane?.kind === 'browser' ? 'browser' : 'terminal',
+      })),
+    };
+  };
+
+  const getPayloadPaneCount = (payload) => {
+    const normalized = normalizeTabPayloadForPaneMerge(payload);
+    return Array.isArray(normalized?.panes) ? normalized.panes.length : 0;
+  };
+
+  const getTabPaneCountForMerge = (tab) => {
+    if (!tab) return 0;
+    if (tab.type === 'browser') return 1;
+    return tab.panes?.size || 0;
+  };
+
+  const canSplitRect = (rect, direction) => {
+    if (!rect) return false;
+    if (direction === 'row') return rect.width >= MIN_PANE_WIDTH * 2;
+    if (direction === 'col') return rect.height >= MIN_PANE_HEIGHT * 2;
+    return false;
+  };
+
+  const clearSpringLoadTimer = () => {
+    if (dragState.springHoverTimer) {
+      clearTimeout(dragState.springHoverTimer);
+      dragState.springHoverTimer = null;
+    }
+    dragState.springHoverTabId = null;
+  };
+
+  const scheduleSpringLoadTab = (tabId) => {
+    if (!tabId || tabId === dragState.tabId || tabId === activeTabId) {
+      clearSpringLoadTimer();
+      return;
+    }
+    if (dragState.springHoverTabId === tabId && dragState.springHoverTimer) return;
+    clearSpringLoadTimer();
+    dragState.springHoverTabId = tabId;
+    dragState.springHoverTimer = setTimeout(() => {
+      dragState.springHoverTimer = null;
+      const target = tabs.get(tabId);
+      if (!target || target.tabId === dragState.tabId) return;
+      activateTab(tabId);
+    }, TAB_SPRING_LOAD_DELAY_MS);
+  };
+
+  // Half-based split hit testing keeps the guide and actual split ratio consistent (50/50).
+  const getPaneDropZone = (rect, clientX, clientY) => {
+    const helper = window.KawaiiPaneDropZone?.getPaneDropZone;
+    if (typeof helper === 'function') {
+      return helper(rect, clientX, clientY);
+    }
+    if (!rect || !rect.width || !rect.height) {
+      return { direction: null, side: null, splitDirection: null, inDeadZone: false };
+    }
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+      return { direction: null, side: null, splitDirection: null, inDeadZone: false };
+    }
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const dx = clientX - centerX;
+    const dy = clientY - centerY;
+    if (dx === 0 && dy === 0) return { direction: null, side: null, splitDirection: null, inDeadZone: false };
+    const nx = dx / (rect.width / 2);
+    const ny = dy / (rect.height / 2);
+    if (Math.abs(nx) >= Math.abs(ny)) {
+      return dx < 0
+        ? { direction: 'left', side: 'before', splitDirection: 'row', inDeadZone: false }
+        : { direction: 'right', side: 'after', splitDirection: 'row', inDeadZone: false };
+    }
+    return dy < 0
+      ? { direction: 'top', side: 'before', splitDirection: 'col', inDeadZone: false }
+      : { direction: 'bottom', side: 'after', splitDirection: 'col', inDeadZone: false };
+  };
+
+  const getLegacyBrowserDropHostRect = (tab) => {
+    const host = tab?.browser?.body || tab?.browser?.root || null;
+    if (!host) return null;
+    const rect = host.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    return { host, rect };
+  };
+
+  const findTabPaneDropTarget = (clientX, clientY) => {
+    const sourceTabId = dragState.tabId;
+    const payload = dragState.payload;
+    if (!sourceTabId || !payload) return null;
+    const targetTab = tabs.get(activeTabId);
+    if (!targetTab) return null;
+    if (targetTab.tabId === sourceTabId) return null;
+
+    const sourcePaneCount = getPayloadPaneCount(payload);
+    if (!sourcePaneCount) return null;
+    const targetPaneCount = getTabPaneCountForMerge(targetTab);
+    const exceedsMax = sourcePaneCount + targetPaneCount > MAX_PANES;
+
+    if (targetTab.type === 'browser') {
+      const host = getLegacyBrowserDropHostRect(targetTab);
+      if (!host) return null;
+      const { rect } = host;
+      if (!(clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom)) {
+        return null;
+      }
+      const zone = getPaneDropZone(rect, clientX, clientY);
+      const valid = Boolean(zone.direction && !exceedsMax && canSplitRect(rect, zone.splitDirection));
+      return {
+        tabId: targetTab.tabId,
+        paneId: null,
+        legacyBrowserTarget: true,
+        rect,
+        valid,
+        ...zone,
+      };
+    }
+
+    let foundPane = null;
+    for (const pane of targetTab.panes.values()) {
+      const rect = pane?.paneEl?.getBoundingClientRect?.();
+      if (!rect || !rect.width || !rect.height) continue;
+      if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) continue;
+      foundPane = { pane, rect };
+      break;
+    }
+    if (!foundPane) return null;
+    const zone = getPaneDropZone(foundPane.rect, clientX, clientY);
+    const valid = Boolean(
+      zone.direction
+      && !exceedsMax
+      && canSplitPane(targetTab, foundPane.pane.paneId, zone.splitDirection)
+    );
+    return {
+      tabId: targetTab.tabId,
+      paneId: foundPane.pane.paneId,
+      legacyBrowserTarget: false,
+      rect: foundPane.rect,
+      valid,
+      ...zone,
+    };
+  };
+
+  const updateSpringLoadHover = (clientX, clientY) => {
+    const barRect = tabsBar.getBoundingClientRect();
+    const inBar = clientX >= barRect.left && clientX <= barRect.right && clientY >= barRect.top && clientY <= barRect.bottom;
+    if (!inBar) {
+      clearSpringLoadTimer();
+      return;
+    }
+    let hoveredId = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    tabsBar.querySelectorAll('.terminal-tab').forEach((tabEl) => {
+      const candidateId = tabEl?.dataset?.tabId || null;
+      if (!candidateId || candidateId === dragState.tabId) return;
+      const rect = tabEl.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return;
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const distance = Math.hypot(clientX - cx, clientY - cy);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        hoveredId = candidateId;
+      }
+    });
+    if (!hoveredId || hoveredId === dragState.tabId) {
+      clearSpringLoadTimer();
+      return;
+    }
+    scheduleSpringLoadTab(hoveredId);
+  };
+
+  const updateTabPaneDropHover = (clientX, clientY) => {
+    const barRect = tabsBar.getBoundingClientRect();
+    const inBar = clientX >= barRect.left - 4 && clientX <= barRect.right + 4 && clientY >= barRect.top - 4 && clientY <= barRect.bottom + 4;
+    if (inBar) {
+      hideTabPaneDropOverlay();
+      return;
+    }
+    const target = findTabPaneDropTarget(clientX, clientY);
+    if (!target) {
+      hideTabPaneDropOverlay();
+      return;
+    }
+    dragState.paneDropTarget = target;
+    showTabPaneDropOverlay(target.rect, target.direction, { valid: target.valid });
+  };
+
+  const convertLegacyBrowserTabToPaneBased = (tab) => {
+    if (!tab || tab.type !== 'browser') return null;
+    const url = getBrowserTabTransferUrl(tab);
+    const paneTitle = tab.autoTitle || tab.titleEl?.textContent || 'Browser';
+    destroyBrowserSurface(tab.browser);
+    tab.browser = null;
+    tab.container.classList.remove('browser-instance');
+    tab.tabEl.classList.remove('browser');
+    if (!tab.paneRoot) {
+      const paneRoot = document.createElement('div');
+      paneRoot.className = 'terminal-pane-root';
+      tab.container.appendChild(paneRoot);
+      tab.paneRoot = paneRoot;
+    } else {
+      tab.paneRoot.innerHTML = '';
+    }
+    tab.type = 'terminal';
+    const pane = createBrowserPane(tab, {
+      title: paneTitle,
+      browser: { url },
+    });
+    tab.paneTree = buildPaneNode(pane.paneId);
+    tab.activePaneId = pane.paneId;
+    renderPaneTree(tab);
+    setActivePane(tab, pane.paneId);
+    return pane.paneId;
+  };
+
+  const createPaneFromTransferPayload = async (tab, panePayload, { attachExisting = true } = {}) => {
+    const kind = panePayload?.kind === 'browser' ? 'browser' : 'terminal';
+    if (kind === 'browser') {
+      return createBrowserPane(tab, {
+        paneId: panePayload.paneId,
+        title: panePayload.title || 'Browser',
+        browser: {
+          url: panePayload?.browser?.url || 'about:blank',
+        },
+      });
+    }
+    return await createPane(tab, {
+      paneId: panePayload.paneId,
+      attachExisting,
+      snapshot: panePayload.snapshot || '',
+      title: panePayload.title || 'Terminal',
+      startCwd: panePayload.cwd || null,
+      profileId: panePayload.profileId || null,
+      initialSettings: settingsSnapshot,
+    });
+  };
+
+  const insertSubtreeAtPane = (tab, targetPaneId, subtree, splitDirection, side) => {
+    const target = findPaneNode(tab?.paneTree, targetPaneId);
+    if (!target) return false;
+    const oldNode = target.node;
+    const splitNode = {
+      type: 'split',
+      direction: splitDirection,
+      ratio: 0.5,
+      a: side === 'before' ? subtree : oldNode,
+      b: side === 'before' ? oldNode : subtree,
+    };
+    if (!target.parent) {
+      tab.paneTree = splitNode;
+    } else if (target.parentSide === 'a') {
+      target.parent.a = splitNode;
+    } else {
+      target.parent.b = splitNode;
+    }
+    return true;
+  };
+
+  const mergeDraggedTabIntoPaneTarget = async (paneDropTarget) => {
+    if (!paneDropTarget?.valid) return false;
+    if (dragState.mergeInProgress) return false;
+    const sourceTabId = dragState.tabId;
+    const sourceTab = tabs.get(sourceTabId);
+    if (!sourceTab) return false;
+    let targetTab = tabs.get(paneDropTarget.tabId);
+    if (!targetTab) return false;
+    if (sourceTabId === targetTab.tabId) return false;
+
+    const payload = normalizeTabPayloadForPaneMerge(dragState.payload || buildTabDragPayload(sourceTabId));
+    if (!payload || !Array.isArray(payload.panes) || payload.panes.length === 0) return false;
+
+    dragState.mergeInProgress = true;
+    try {
+      if (targetTab.type === 'browser') {
+        convertLegacyBrowserTabToPaneBased(targetTab);
+        targetTab = tabs.get(paneDropTarget.tabId) || targetTab;
+      }
+      if (!targetTab || targetTab.type !== 'terminal') return false;
+      const targetPaneId = paneDropTarget.paneId || targetTab.activePaneId || Array.from(targetTab.panes.keys())[0];
+      if (!targetPaneId) return false;
+
+      await detachTab(sourceTabId, { closeWindowOnEmpty: false });
+
+      for (const panePayload of payload.panes) {
+        await createPaneFromTransferPayload(targetTab, panePayload, { attachExisting: true });
+      }
+
+      const sourceTree = normalizePaneLayout(payload.splitLayout) || buildPaneNode(payload.panes[0].paneId);
+      if (!insertSubtreeAtPane(targetTab, targetPaneId, sourceTree, paneDropTarget.splitDirection, paneDropTarget.side)) {
+        return false;
+      }
+      renderPaneTree(targetTab);
+      activateTab(targetTab.tabId);
+      const nextActivePaneId = payload.activePaneId && targetTab.panes.has(payload.activePaneId)
+        ? payload.activePaneId
+        : payload.panes[0]?.paneId;
+      if (nextActivePaneId) {
+        setActivePane(targetTab, nextActivePaneId);
+      }
+      dragState.mergeCommitted = true;
+      return true;
+    } catch (error) {
+      console.error('[TabDnD] pane merge failed', error);
+      showActivePaneToast('Failed to merge tab into pane', { tone: 'error' });
+      return false;
+    } finally {
+      dragState.mergeInProgress = false;
+    }
+  };
+
   const scheduleMainDragMove = () => {
     if (!USE_NATIVE_GHOST_WINDOW) return;
     if (dragState.moveRaf) return;
     dragState.moveRaf = requestAnimationFrame(() => {
       dragState.moveRaf = null;
+      const effectiveForceDetach = Boolean(dragState.forceDetach && !dragState.paneDropTarget?.valid);
       window.windowAPI?.tabDragMove?.({
         screenX: dragState.lastScreenX,
         screenY: dragState.lastScreenY,
-        forceDetach: dragState.forceDetach,
+        forceDetach: effectiveForceDetach,
       });
     });
   };
@@ -1061,6 +1774,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     dragState.tabEl = tabEl;
     dragState.payload = null;
     dragState.didDrop = false;
+    dragState.sourceActiveTabId = activeTabId;
     dragState.startClientX = event.clientX;
     dragState.startClientY = event.clientY;
     dragState.startScreenX = event.screenX;
@@ -1075,6 +1789,10 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     dragState.reorderCandidate = null;
     dragState.forceDetach = false;
     dragState.suppressClick = false;
+    dragState.mergeCommitted = false;
+    dragState.mergeInProgress = false;
+    clearSpringLoadTimer();
+    hideTabPaneDropOverlay();
     dragState.tabEl.setPointerCapture?.(event.pointerId);
     return true;
   };
@@ -1184,13 +1902,26 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       hideGhost();
     }
 
+    updateSpringLoadHover(event.clientX, event.clientY);
+    updateTabPaneDropHover(event.clientX, event.clientY);
+
     scheduleMainDragMove();
   };
 
-  const endPointerDrag = (event) => {
+  const endPointerDrag = async (event) => {
     if (!dragState.pending) return;
     if (dragState.pointerId !== null && event && event.pointerId !== dragState.pointerId) return;
     dragState.tabEl?.releasePointerCapture?.(dragState.pointerId);
+
+    const paneDropTarget = dragState.paneDropTarget ? { ...dragState.paneDropTarget } : null;
+    const effectiveForceDetach = Boolean(dragState.forceDetach && !paneDropTarget?.valid);
+    let handledLocally = false;
+    if (dragState.dragging && paneDropTarget?.valid) {
+      handledLocally = await mergeDraggedTabIntoPaneTarget(paneDropTarget);
+      if (!handledLocally) {
+        handledLocally = true;
+      }
+    }
 
     if (dragState.dragging) {
       dragState.suppressClick = true;
@@ -1200,7 +1931,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
         window.windowAPI?.tabDragEnd?.({
           screenX: endScreenX,
           screenY: endScreenY,
-          forceDetach: dragState.forceDetach,
+          forceDetach: effectiveForceDetach,
+          handledLocally,
         });
       }
     }
@@ -1229,6 +1961,9 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     dragState.lastReorderTargetId = null;
     dragState.lastReorderDirection = 0;
     dragState.reorderCandidate = null;
+    dragState.sourceActiveTabId = null;
+    clearSpringLoadTimer();
+    hideTabPaneDropOverlay();
     if (dragState.moveRaf) {
       cancelAnimationFrame(dragState.moveRaf);
       dragState.moveRaf = null;
@@ -1263,6 +1998,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     tabsBar.classList.remove('drag-target');
     hideDropIndicator();
     hideGhost();
+    hideTabPaneDropOverlay();
     dragState.lastDropBeforeEl = null;
   });
 
@@ -1960,36 +2696,41 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     if (isActiveTab) {
       pinManager?.setActiveTab?.(tab.tabId);
       pinManager?.setActivePane?.(pane.paneId, pane);
-      pinManager?.attachTerminal?.(pane.paneId, pane.terminalManager.terminal, pane.terminalManager, pane);
       historyManager?.setActiveTab?.(tab.tabId);
       historyManager?.setActiveTabLabel?.(tab.titleEl?.textContent || tab.tabId);
       historyManager?.setActivePane?.(pane.paneId, pane);
-      const activeCwd = pane.terminalManager.getCwd?.();
-      if (activeCwd) {
-        imagePreviewManager?.setBasePath?.(activeCwd);
-        mdPreviewManager?.setBasePath?.(activeCwd);
-        pane.lastCwd = activeCwd;
-        updateLastActiveCwd(pane, tab, activeCwd);
-      } else {
-        void pane.terminalManager.refreshCwdFromMain?.({ force: true });
-      }
-      pane.terminalManager.ensureOpen?.();
-      pane.terminalManager.handleResize?.();
-      pane.terminalManager.focus();
-      setTimeout(() => {
-        if (tab.tabId !== activeTabId || tab.activePaneId !== paneId) return;
-        const activeEl = document.activeElement;
-        if (activeEl) {
-          if (activeEl.classList && activeEl.classList.contains('xterm-helper-textarea')) return;
-          if (activeEl.closest && !activeEl.closest('.terminal-panel')) return;
-          if (activeEl.isContentEditable) return;
-          if (activeEl.tagName) {
-            const tag = activeEl.tagName.toLowerCase();
-            if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
-          }
+      if (isTerminalPane(pane)) {
+        pinManager?.attachTerminal?.(pane.paneId, pane.terminalManager?.terminal, pane.terminalManager, pane);
+        const activeCwd = pane.terminalManager?.getCwd?.();
+        if (activeCwd) {
+          imagePreviewManager?.setBasePath?.(activeCwd);
+          mdPreviewManager?.setBasePath?.(activeCwd);
+          pane.lastCwd = activeCwd;
+          updateLastActiveCwd(pane, tab, activeCwd);
+        } else {
+          void pane.terminalManager?.refreshCwdFromMain?.({ force: true });
         }
-        pane.terminalManager.focus();
-      }, 30);
+        pane.terminalManager?.ensureOpen?.();
+        pane.terminalManager?.handleResize?.();
+        pane.terminalManager?.focus?.();
+        setTimeout(() => {
+          if (tab.tabId !== activeTabId || tab.activePaneId !== paneId) return;
+          const activeEl = document.activeElement;
+          if (activeEl) {
+            if (activeEl.classList && activeEl.classList.contains('xterm-helper-textarea')) return;
+            if (activeEl.closest && !activeEl.closest('.terminal-panel')) return;
+            if (activeEl.isContentEditable) return;
+            if (activeEl.tagName) {
+              const tag = activeEl.tagName.toLowerCase();
+              if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+            }
+          }
+          pane.terminalManager?.focus?.();
+        }, 30);
+      } else if (isBrowserPane(pane)) {
+        pane.browser?.urlInputEl?.blur?.();
+        pane.browser?.webviewEl?.focus?.();
+      }
     }
     updateTabWslIndicator(tab);
   };
@@ -2291,6 +3032,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     rememberWslProfile(profileId);
 
     const pane = {
+      kind: 'terminal',
       paneId,
       paneEl,
       headerEl,
@@ -2352,6 +3094,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     if (!canSplitPane(tab, paneId, direction)) return null;
     const sourcePane = tab.panes.get(paneId);
     if (!sourcePane) return null;
+    if (!isTerminalPane(sourcePane)) return null;
     const sourceCwd = sourcePane.terminalManager.getCwd?.();
     const sourceProfileId = sourcePane.profileId || sourcePane.terminalManager?.profileId || null;
     const newPane = await createPane(tab, { sourceCwd, profileId: sourceProfileId, initialSettings: settingsSnapshot });
@@ -2388,16 +3131,22 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     if (!target || !target.parent) return;
     const pane = tab.panes.get(paneId);
     if (pane) {
-      window.statusAPI?.sendPaneEvent?.({
-        pane_id: paneId,
-        tab_id: tab.tabId,
-        event: 'close',
-        timestamp: Date.now(),
-      });
+      if (isTerminalPane(pane)) {
+        window.statusAPI?.sendPaneEvent?.({
+          pane_id: paneId,
+          tab_id: tab.tabId,
+          event: 'close',
+          timestamp: Date.now(),
+        });
+      }
       pane.imagePreviewDisposable?.dispose?.();
       pane.mdPreviewDisposable?.dispose?.();
-      pane.terminalManager.destroy();
-      await window.terminalAPI.close(paneId);
+      if (isBrowserPane(pane)) {
+        destroyBrowserPane(pane);
+      } else {
+        pane.terminalManager?.destroy?.();
+        await window.terminalAPI.close(paneId);
+      }
       pane.paneEl.remove();
       tab.panes.delete(paneId);
       historyManager?.handlePaneClose?.(paneId);
@@ -2482,7 +3231,12 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       if (!tab?.panes?.has?.(paneId)) continue;
       activateTab(tabId);
       setActivePane(tab, paneId);
-      tab.panes.get(paneId)?.terminalManager?.focus?.();
+      const pane = tab.panes.get(paneId);
+      if (isTerminalPane(pane)) {
+        pane?.terminalManager?.focus?.();
+      } else {
+        pane?.browser?.webviewEl?.focus?.();
+      }
       return true;
     }
     return false;
@@ -2598,10 +3352,11 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
         if (e.button !== 0) return;
         if (e.target?.closest?.('.terminal-tab-close')) return;
         if (e.target?.closest?.('.terminal-tab-rename')) return;
-        activateTab(tabId);
         if (beginPointerDrag(tabId, tabEl, e)) {
           e.preventDefault();
+          return;
         }
+        activateTab(tabId);
       });
 
       const tab = {
@@ -2637,18 +3392,29 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       } else if (paneLayout && Array.isArray(panePayloads) && panePayloads.length > 0) {
         for (const panePayload of panePayloads) {
           const allowPrefill = !restoreSession || restorePrefillEnabled;
-          await createPane(tab, {
-            paneId: panePayload.paneId,
-            attachExisting,
-            snapshot: allowPrefill ? panePayload.snapshot : null,
-            title: panePayload.title || titleEl.textContent,
-            startCwd: panePayload.cwd || null,
-            profileId: panePayload.profileId || profileId,
-            prefillLabel: allowPrefill && restoreSession ? '--- Restored snapshot ---' : null,
-            deferPtyStart,
-            initialSettings: effectiveInitialSettings,
-            deferXtermOpen,
-          });
+          const paneKind = panePayload?.kind === 'browser' ? 'browser' : 'terminal';
+          if (paneKind === 'browser') {
+            createBrowserPane(tab, {
+              paneId: panePayload.paneId,
+              title: panePayload.title || titleEl.textContent || 'Browser',
+              browser: {
+                url: panePayload?.browser?.url || 'about:blank',
+              },
+            });
+          } else {
+            await createPane(tab, {
+              paneId: panePayload.paneId,
+              attachExisting,
+              snapshot: allowPrefill ? panePayload.snapshot : null,
+              title: panePayload.title || titleEl.textContent,
+              startCwd: panePayload.cwd || null,
+              profileId: panePayload.profileId || profileId,
+              prefillLabel: allowPrefill && restoreSession ? '--- Restored snapshot ---' : null,
+              deferPtyStart,
+              initialSettings: effectiveInitialSettings,
+              deferXtermOpen,
+            });
+          }
         }
         tab.paneTree = paneLayout;
         tab.activePaneId = (providedActivePaneId && tab.panes.has(providedActivePaneId))
@@ -2713,6 +3479,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
     if (!keepPty) {
       for (const pane of tab.panes.values()) {
+        if (!isTerminalPane(pane)) continue;
         const pid = pane?.paneId;
         if (!pid) continue;
         window.statusAPI?.sendPaneEvent?.({
@@ -2723,14 +3490,22 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
         });
       }
       for (const pane of tab.panes.values()) {
+        if (!isTerminalPane(pane)) continue;
         await window.terminalAPI.close(pane.paneId);
       }
     }
     tab.panes.forEach((pane) => {
-      pane.terminalManager.destroy?.();
-      pane.imagePreviewDisposable?.dispose?.();
-      pane.mdPreviewDisposable?.dispose?.();
+      if (isBrowserPane(pane)) {
+        destroyBrowserPane(pane);
+      } else {
+        pane.terminalManager?.destroy?.();
+        pane.imagePreviewDisposable?.dispose?.();
+        pane.mdPreviewDisposable?.dispose?.();
+      }
     });
+    if (tab.type === 'browser') {
+      destroyBrowserSurface(tab.browser);
+    }
     tab.container.remove();
 
     // タブ閉じるアニメーション
@@ -2905,7 +3680,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       if (predicate && !predicate({ isNotified, isCurrent })) continue;
       const title = tab.customTitle || tab.autoTitle || `Terminal ${tab.index}`;
       const activePane = tab.panes.get(tab.activePaneId);
-      const previewHtml = activePane?.terminalManager.getPreviewHtml?.(200) || null;
+      const previewHtml = activePane?.terminalManager?.getPreviewHtml?.(200) || null;
       result.push({ tabId, title, previewHtml, isNotified, isCurrent });
     }
     return result;
@@ -3019,6 +3794,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     if (!tab) return false;
     if (tab.type !== 'terminal') return false;
     const paneId = tab.activePaneId;
+    const pane = paneId ? tab.panes.get(paneId) : null;
+    if (!isTerminalPane(pane)) return false;
     return canSplitPane(tab, paneId, direction);
   };
 
@@ -3027,6 +3804,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     if (!tab) return null;
     if (tab.type !== 'terminal') return null;
     const paneId = tab.activePaneId;
+    const pane = paneId ? tab.panes.get(paneId) : null;
+    if (!isTerminalPane(pane)) return null;
     return await splitPane(tab, paneId, direction, side);
   };
 
@@ -3049,7 +3828,10 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   let settingsListener = null;
   const updateSettingsAll = (settings) => {
     tabs.forEach(tab => {
-      tab.panes.forEach(pane => pane.terminalManager.updateSettings(settings));
+      tab.panes.forEach((pane) => {
+        if (!isTerminalPane(pane)) return;
+        pane.terminalManager?.updateSettings?.(settings);
+      });
     });
     const snapshot = mergeTerminalSettings(settingsSnapshot, settings);
     settingsSnapshot = snapshot;
@@ -3298,12 +4080,25 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
         });
         continue;
       }
-        const panesOut = Array.from(tab.panes.values()).map((pane) => ({
+      const panesOut = Array.from(tab.panes.values()).map((pane) => {
+        if (isBrowserPane(pane)) {
+          return {
+            kind: 'browser',
+            paneId: pane.paneId,
+            title: pane.titleEl?.textContent || pane.autoTitle || 'Browser',
+            browser: {
+              url: getBrowserPaneTransferUrl(pane),
+            },
+          };
+        }
+        return {
+          kind: 'terminal',
           paneId: pane.paneId,
           title: pane.titleEl?.textContent || 'Terminal',
-          cwd: pane.terminalManager.getCwd?.() || null,
+          cwd: pane.terminalManager?.getCwd?.() || null,
           profileId: pane.profileId || pane.terminalManager?.profileId || null,
-        }));
+        };
+      });
       tabsOut.push({
         tabId: tab.tabId,
         type: 'terminal',
@@ -3333,9 +4128,10 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     for (const tab of tabs.values()) {
       if (!tab) continue;
       for (const pane of tab.panes.values()) {
+        if (!isTerminalPane(pane)) continue;
         if (!pane?.sessionSnapshotDirty) continue;
         pane.sessionSnapshotDirty = false;
-        const content = pane.terminalManager.getScreenContent?.({ maxLines: lines, maxChars: chars }) || '';
+        const content = pane.terminalManager?.getScreenContent?.({ maxLines: lines, maxChars: chars }) || '';
         if (!content) continue;
         const nextHash = hashString(content);
         if (nextHash === pane.sessionSnapshotHash) continue;

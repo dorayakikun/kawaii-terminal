@@ -1869,7 +1869,7 @@ app.on('second-instance', () => {
     }
     });
   
-    ipcMain.on('tab:drag-end', (event, payload = {}) => {
+  ipcMain.on('tab:drag-end', (event, payload = {}) => {
       if (!isTrustedIpcSender(event)) return;
       if (!dragSession) return;
       const endX = Number.isFinite(payload.screenX) ? payload.screenX : dragSession.lastPoint?.x;
@@ -1884,8 +1884,11 @@ app.on('second-instance', () => {
     const isDifferentWindow = overWin && String(overWin.id) !== String(dragSession.sourceWindowId);
     const adoptPayload = dragSession.adoptPayload;
     const forceDetach = Boolean(payload.forceDetach) || dragSession.forceDetach;
+    const handledLocally = Boolean(payload.handledLocally);
 
-    if (isDifferentWindow && adoptPayload?.tabId) {
+    if (handledLocally) {
+      // Renderer already merged the tab into a pane locally; only cleanup drag session.
+    } else if (isDifferentWindow && adoptPayload?.tabId) {
       overWin.webContents.send('window:adopt-tab', adoptPayload);
       if (dragSession.sourceWindowId) {
         const sourceWin = windowManager.getById(dragSession.sourceWindowId);

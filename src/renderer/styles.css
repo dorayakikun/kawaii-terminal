@@ -2043,6 +2043,119 @@ body.session-sidebar-resizing {
   white-space: nowrap;
 }
 
+.tab-pane-drop-overlay {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  border-radius: 6px;
+  border: 1px solid var(--kt-color-border-strong);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--kt-color-border-default);
+  pointer-events: none;
+  opacity: 0;
+  z-index: 9998;
+  transition: opacity 0.08s ease;
+}
+
+.tab-pane-drop-overlay::before,
+.tab-pane-drop-overlay::after {
+  content: '';
+  position: absolute;
+  pointer-events: none;
+}
+
+.tab-pane-drop-overlay::before {
+  display: none;
+  background: var(--kt-color-accent-primary);
+  opacity: 0.95;
+  border-radius: 999px;
+  z-index: 2;
+}
+
+.tab-pane-drop-overlay::after {
+  inset: 0;
+  border-radius: inherit;
+  background: transparent;
+  opacity: 0;
+  z-index: 1;
+}
+
+.tab-pane-drop-overlay.show {
+  opacity: 1;
+}
+
+.tab-pane-drop-overlay.is-left::after {
+  background: linear-gradient(to right, var(--kt-color-component-drag-hint-bg) 0 50%, transparent 50% 100%);
+  opacity: 1;
+}
+
+.tab-pane-drop-overlay.is-left::before {
+  display: block;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  left: 50%;
+  transform: translateX(-1px);
+}
+
+.tab-pane-drop-overlay.is-right::after {
+  background: linear-gradient(to left, var(--kt-color-component-drag-hint-bg) 0 50%, transparent 50% 100%);
+  opacity: 1;
+}
+
+.tab-pane-drop-overlay.is-right::before {
+  display: block;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  right: 50%;
+  transform: translateX(1px);
+}
+
+.tab-pane-drop-overlay.is-top::after {
+  background: linear-gradient(to bottom, var(--kt-color-component-drag-hint-bg) 0 50%, transparent 50% 100%);
+  opacity: 1;
+}
+
+.tab-pane-drop-overlay.is-top::before {
+  display: block;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  top: 50%;
+  transform: translateY(-1px);
+}
+
+.tab-pane-drop-overlay.is-bottom::after {
+  background: linear-gradient(to top, var(--kt-color-component-drag-hint-bg) 0 50%, transparent 50% 100%);
+  opacity: 1;
+}
+
+.tab-pane-drop-overlay.is-bottom::before {
+  display: block;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  bottom: 50%;
+  transform: translateY(1px);
+}
+
+.tab-pane-drop-overlay.is-invalid {
+  border-color: var(--kt-color-border-default);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--kt-color-border-default);
+}
+
+.tab-pane-drop-overlay.is-invalid::after {
+  opacity: 0.45;
+}
+
+.tab-pane-drop-overlay.is-invalid::before {
+  opacity: 0.6;
+}
+
 .terminal-tab:hover {
   background: var(--kt-color-state-active);
   color: var(--kt-color-text-primary);
@@ -2360,6 +2473,15 @@ body.session-sidebar-resizing {
   background: var(--kt-color-bg-surface);
 }
 
+/* During tab drag, let host document receive pointermove over browser page area. */
+body.tab-dragging .browser-tab-body::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: transparent;
+}
+
 .browser-tab-webview {
   display: inline-flex;
   flex: 1 1 0;
@@ -2369,6 +2491,10 @@ body.session-sidebar-resizing {
   min-height: 0;
   border: none;
   background: white;
+}
+
+body.tab-dragging .browser-tab-webview {
+  pointer-events: none;
 }
 
 .terminal-pane-node {
@@ -2529,6 +2655,11 @@ body.session-sidebar-resizing {
   flex: 1 1 0;
   min-width: 0;
   min-height: 0;
+}
+
+.browser-pane-content {
+  position: relative;
+  overflow: hidden;
 }
 
 .terminal-loading {
