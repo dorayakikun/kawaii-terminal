@@ -17,7 +17,7 @@ const { PaneLifecycleSource } = require('../status/sources/pane-lifecycle-source
 const { SettingsStore } = require('../core/settings/settings-store');
 const { registerSettingsIpc } = require('../core/settings/settings-ipc');
 const { registerOnboardingIpc } = require('../features/onboarding/onboarding-ipc');
-const { hardenWebContents, isTrustedIpcSender } = require('./navigation-guard');
+const { hardenWebContents, isTrustedIpcSender, parseUrlSafe } = require('./navigation-guard');
 const {
   clampInt,
   createSessionKey,
@@ -92,6 +92,14 @@ try {
   // 開発時にメニューが "Electron" になるのを防ぐ
   app.setName(APP_DISPLAY_NAME);
 } catch (_) { /* noop */ }
+
+function isAllowedEmbeddedBrowserUrl(urlString) {
+  if (typeof urlString !== 'string') return false;
+  if (/^about:blank$/i.test(urlString.trim())) return true;
+  const parsed = parseUrlSafe(urlString);
+  if (!parsed) return false;
+  return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+}
 try {
   if (process.platform === 'win32') {
     app.setAppUserModelId(APP_ID);
@@ -501,6 +509,7 @@ class WindowManager {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: false, // Required for fs access in preload
+        webviewTag: true,
       },
       backgroundColor: '#0d0d14',
     };
@@ -773,11 +782,13 @@ function startTabDragSession(payload = {}) {
   stopTabDragSession();
   const {
     title = 'Terminal',
+    type = 'terminal',
     customTitle = false,
     snapshot = '',
     panes,
     splitLayout,
     activePaneId,
+    browser,
     width = 180,
     height = 26,
     offsetX = 12,
@@ -795,12 +806,18 @@ function startTabDragSession(payload = {}) {
 
   const adoptPayload = {
     tabId,
+    type: type === 'browser' ? 'browser' : 'terminal',
     title,
     customTitle: Boolean(customTitle),
     snapshot: typeof snapshot === 'string' ? snapshot : '',
     panes: Array.isArray(panes) ? panes : null,
     splitLayout: splitLayout || null,
     activePaneId: activePaneId || null,
+    browser: (type === 'browser' && browser && typeof browser === 'object')
+      ? {
+          url: typeof browser.url === 'string' ? browser.url : 'about:blank',
+        }
+      : null,
     sourceWindowId,
   };
 
@@ -1306,6 +1323,41 @@ app.on('second-instance', () => {
     } catch (e) {
       console.error('[Main] Failed to set permission handlers:', e);
     }
+    app.on('web-contents-created', (_event, contents) => {
+      try {
+        contents.setWindowOpenHandler?.(() => ({ action: 'deny' }));
+      } catch (_) { /* noop */ }
+
+      contents.on('will-attach-webview', (event, webPreferences, params = {}) => {
+        const src = typeof params?.src === 'string' ? params.src.trim() : '';
+        if (!isAllowedEmbeddedBrowserUrl(src)) {
+          try { event.preventDefault(); } catch (_) { /* noop */ }
+          return;
+        }
+        try {
+          delete webPreferences.preload;
+          delete webPreferences.preloadURL;
+          delete webPreferences.additionalArguments;
+          webPreferences.nodeIntegration = false;
+          webPreferences.nodeIntegrationInSubFrames = false;
+          webPreferences.nodeIntegrationInWorker = false;
+          webPreferences.enableRemoteModule = false;
+          webPreferences.contextIsolation = true;
+          webPreferences.sandbox = true;
+          webPreferences.webSecurity = true;
+          webPreferences.webviewTag = false;
+        } catch (_) { /* noop */ }
+      });
+
+      if (contents.getType?.() === 'webview') {
+        const blockUntrusted = (event, url) => {
+          if (isAllowedEmbeddedBrowserUrl(url)) return;
+          try { event.preventDefault(); } catch (_) { /* noop */ }
+        };
+        contents.on('will-navigate', blockUntrusted);
+        contents.on('will-redirect', blockUntrusted);
+      }
+    });
 
     setupApplicationMenu();
     registerGlobalShortcuts();

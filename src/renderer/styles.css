@@ -2106,6 +2106,18 @@ body.session-sidebar-resizing {
   display: none;
 }
 
+.terminal-tab.browser .terminal-tab-status-dot,
+.terminal-tab.browser .terminal-tab-wsl,
+.terminal-tab.browser .terminal-tab-split {
+  display: none !important;
+}
+
+.terminal-tab.browser.browser-loading .terminal-tab-title::after {
+  content: '…';
+  margin-left: 4px;
+  color: var(--kt-color-text-secondary);
+}
+
 .terminal-tab-rename {
   width: 160px;
   max-width: 160px;
@@ -2263,6 +2275,100 @@ body.session-sidebar-resizing {
   display: flex;
   min-width: 0;
   min-height: 0;
+}
+
+.browser-tab-root {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--kt-color-bg-surface);
+}
+
+.browser-tab-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--kt-color-border-default);
+  background: var(--kt-color-bg-elevated);
+  min-height: 36px;
+  -webkit-app-region: no-drag;
+}
+
+.browser-tab-url-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--kt-color-border-default);
+  background: var(--kt-color-bg-surface);
+  color: var(--kt-color-text-primary);
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.browser-tab-url-input:focus {
+  outline: none;
+  border-color: var(--kt-color-border-strong);
+}
+
+.browser-tab-btn {
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--kt-color-border-default);
+  background: var(--kt-color-bg-surface);
+  color: var(--kt-color-text-primary);
+  padding: 0 8px;
+  font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.browser-tab-btn:hover {
+  background: var(--kt-color-state-hover);
+}
+
+.browser-tab-status {
+  min-width: 0;
+  max-width: 260px;
+  font-size: 11px;
+  color: var(--kt-color-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: none;
+  flex: 0 1 auto;
+}
+
+.browser-tab-status.show {
+  display: block;
+}
+
+.browser-tab-status.error {
+  color: var(--kt-color-status-error);
+}
+
+.browser-tab-body {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  background: var(--kt-color-bg-surface);
+}
+
+.browser-tab-webview {
+  display: inline-flex;
+  flex: 1 1 0;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  background: white;
 }
 
 .terminal-pane-node {

@@ -403,6 +403,7 @@ class TerminalManager {
     this.outputDisposer = null;
     this.pasteHandler = null;
     this.linkHintEl = null;
+    this.linkHintMode = 'generic';
     this.lastMouseX = 0;
     this.lastMouseY = 0;
     this.currentCwd = null; // Tracked via OSC sequences
@@ -426,6 +427,7 @@ class TerminalManager {
     this.previewCacheTimer = null;
     this.onPreviewUpdated = null;
     this.mdPreviewManager = null;
+    this.httpUrlOpener = null;
     this.isOpen = false;
     this.deferOpen = false;
     this.pendingPrefill = null;
@@ -439,6 +441,53 @@ class TerminalManager {
 
   setMdPreviewManager(manager) {
     this.mdPreviewManager = manager || null;
+  }
+
+  setHttpUrlOpener(opener) {
+    this.httpUrlOpener = typeof opener === 'function' ? opener : null;
+  }
+
+  normalizeHttpUrl(value, { allowProtocolLess = true } = {}) {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw) return '';
+    let candidate = raw;
+    if (/^https?:\/\//i.test(candidate)) {
+      try {
+        const parsed = new URL(candidate);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+        return parsed.toString();
+      } catch (_) {
+        return '';
+      }
+    }
+    if (!allowProtocolLess) return '';
+    if (/^[a-z][a-z0-9+.-]*:/i.test(candidate)) return '';
+    if (!/[.]/.test(candidate)) return '';
+    try {
+      const parsed = new URL(`https://${candidate}`);
+      return parsed.toString();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  async openHttpUrl(url, { allowProtocolLess = false } = {}) {
+    const normalized = this.normalizeHttpUrl(url, { allowProtocolLess });
+    if (!normalized) return false;
+    if (!/^https?:\/\//i.test(normalized)) return false;
+    if (this.httpUrlOpener) {
+      try {
+        const handled = await this.httpUrlOpener(normalized, { terminalId: this.tabId });
+        if (handled !== false) return true;
+      } catch (_) {
+        // Fallback to external browser below.
+      }
+    }
+    if (window.shellAPI?.openExternal) {
+      window.shellAPI.openExternal(normalized);
+      return true;
+    }
+    return false;
   }
 
   scheduleCwdRefresh(delayMs = 220) {
@@ -819,12 +868,10 @@ class TerminalManager {
         activate: (event, text) => {
           event?.preventDefault?.();
           if (!this.shouldOpenLink(event)) return;
-          const url = typeof text === 'string' ? text.trim() : '';
-          if (!/^https?:\/\//i.test(url)) return;
-          window.shellAPI?.openExternal?.(url);
+          void this.openHttpUrl(text, { allowProtocolLess: false });
         },
         hover: (event) => {
-          this.showLinkHintFromEvent(event);
+          this.showLinkHintFromEvent(event, 'browser');
         },
         leave: () => {
           this.hideLinkHint();
@@ -1197,12 +1244,10 @@ class TerminalManager {
       this.webLinksAddon = new WebLinksAddonCtor((event, uri) => {
         event?.preventDefault?.();
         if (!this.shouldOpenLink(event)) return;
-        if (window.shellAPI?.openExternal) {
-          window.shellAPI.openExternal(uri);
-        }
+        void this.openHttpUrl(uri, { allowProtocolLess: false });
       }, {
         hover: (event) => {
-          this.showLinkHintFromEvent(event);
+          this.showLinkHintFromEvent(event, 'browser');
         },
         leave: () => {
           this.hideLinkHint();
@@ -1246,14 +1291,10 @@ class TerminalManager {
                 activate: (event, linkText) => {
                   event?.preventDefault?.();
                   if (!this.shouldOpenLink(event)) return;
-                  if (window.shellAPI?.openExternal) {
-                    // Add https:// if no protocol specified
-                    const urlToOpen = /^https?:\/\//i.test(linkText) ? linkText : `https://${linkText}`;
-                    window.shellAPI.openExternal(urlToOpen);
-                  }
+                  void this.openHttpUrl(linkText, { allowProtocolLess: true });
                 },
                 hover: (event) => {
-                  this.showLinkHintFromEvent(event);
+                  this.showLinkHintFromEvent(event, 'browser');
                 },
                 leave: () => {
                   this.hideLinkHint();
@@ -1307,7 +1348,7 @@ class TerminalManager {
                 window.fileAPI?.openFile?.(resolvedPath, cwd || undefined);
               },
               hover: (event) => {
-                this.showLinkHintFromEvent(event);
+                this.showLinkHintFromEvent(event, 'file');
                 if (isMarkdown) {
                   this.mdPreviewManager?.schedulePreview?.(resolvedPath);
                 }
@@ -1459,7 +1500,7 @@ class TerminalManager {
                 }
               },
               hover: (event) => {
-                this.showLinkHintFromEvent(event);
+                this.showLinkHintFromEvent(event, 'file');
                 if (isMarkdown) {
                   this.mdPreviewManager?.schedulePreview?.(capturedPath);
                 }
@@ -1745,10 +1786,14 @@ class TerminalManager {
 
   getLinkHintText() {
     const isMac = window.windowAPI?.platform === 'darwin';
-    return isMac ? 'Cmd+Click to open' : 'Ctrl+Click to open';
+    const key = isMac ? 'Cmd+Click' : 'Ctrl+Click';
+    if (this.linkHintMode === 'browser') return `${key} to open in browser tab`;
+    if (this.linkHintMode === 'file') return `${key} to open file`;
+    return `${key} to open link`;
   }
 
-  showLinkHintFromEvent(event) {
+  showLinkHintFromEvent(event, mode = 'generic') {
+    this.linkHintMode = mode || 'generic';
     const x = typeof event?.clientX === 'number' ? event.clientX : this.lastMouseX;
     const y = typeof event?.clientY === 'number' ? event.clientY : this.lastMouseY;
     this.showLinkHint(x, y);
@@ -1785,6 +1830,7 @@ class TerminalManager {
 
   hideLinkHint() {
     if (!this.linkHintEl) return;
+    this.linkHintMode = 'generic';
     this.linkHintEl.classList.remove('show');
   }
 

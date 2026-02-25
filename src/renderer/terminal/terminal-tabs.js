@@ -88,6 +88,11 @@ function getTabProfileId(tab) {
 
 function updateTabWslIndicator(tab) {
   if (!tab?.tabEl || !tab?.wslBadgeEl) return;
+  if (tab.type === 'browser') {
+    tab.tabEl.classList.remove('wsl');
+    tab.wslBadgeEl.setAttribute('aria-hidden', 'true');
+    return;
+  }
   const profileId = getTabProfileId(tab);
   const isWsl = isWslProfile(profileId);
   tab.tabEl.classList.toggle('wsl', isWsl);
@@ -262,6 +267,287 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     return pane?.terminalManager || null;
   };
 
+  const normalizeBrowserUrl = (value, { allowBlank = true, allowProtocolLess = true } = {}) => {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    if (!raw) return allowBlank ? 'about:blank' : '';
+    let candidate = raw;
+    if (/^about:blank$/i.test(candidate)) return 'about:blank';
+    if (/^https?:\/\//i.test(candidate)) {
+      try {
+        const parsed = new URL(candidate);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+        return parsed.toString();
+      } catch (_) {
+        return '';
+      }
+    }
+    if (!allowProtocolLess) return '';
+    if (/^[a-z][a-z0-9+.-]*:/i.test(candidate)) return '';
+    if (!candidate.includes('.')) return '';
+    try {
+      const parsed = new URL(`https://${candidate}`);
+      return parsed.toString();
+    } catch (_) {
+      return '';
+    }
+  };
+
+  const getBrowserTitleFromUrl = (url) => {
+    const normalized = normalizeBrowserUrl(url, { allowBlank: true, allowProtocolLess: false });
+    if (!normalized || normalized === 'about:blank') return 'Browser';
+    try {
+      const parsed = new URL(normalized);
+      return parsed.host || 'Browser';
+    } catch (_) {
+      return 'Browser';
+    }
+  };
+
+  const getBrowserTabTransferUrl = (tab) => {
+    if (!tab || tab.type !== 'browser') return 'about:blank';
+    let candidate = '';
+    try {
+      if (typeof tab.browser?.webviewEl?.getURL === 'function') {
+        candidate = String(tab.browser.webviewEl.getURL() || '').trim();
+      }
+    } catch (_) {
+      candidate = '';
+    }
+    if (!candidate) {
+      candidate = String(tab.browser?.requestedUrl || '').trim();
+    }
+    if (!candidate) {
+      candidate = String(tab.browser?.url || '').trim();
+    }
+    if (!candidate) {
+      candidate = String(tab.browser?.urlInputEl?.value || '').trim();
+    }
+    return normalizeBrowserUrl(candidate, { allowBlank: true, allowProtocolLess: true }) || 'about:blank';
+  };
+
+  const applyBrowserTabAutoTitle = (tab, { pageTitle, url } = {}) => {
+    if (!tab || tab.type !== 'browser') return;
+    const nextTitle = String(pageTitle || '').trim() || getBrowserTitleFromUrl(url || tab?.browser?.url);
+    tab.autoTitle = nextTitle || 'Browser';
+    if (!tab.customTitle && tab.titleEl) {
+      tab.titleEl.textContent = tab.autoTitle;
+      historyManager?.setActiveTabLabel?.(tab.titleEl.textContent || tab.tabId);
+    }
+  };
+
+  const setBrowserStatus = (tab, message, tone = '') => {
+    if (!tab?.browser?.statusEl) return;
+    const text = String(message || '').trim();
+    const statusEl = tab.browser.statusEl;
+    statusEl.textContent = text;
+    statusEl.classList.toggle('show', Boolean(text));
+    statusEl.classList.toggle('error', tone === 'error');
+  };
+
+  const loadBrowserUrlInTab = (tab, value, { allowBlank = true } = {}) => {
+    if (!tab || tab.type !== 'browser' || !tab.browser?.webviewEl) return { ok: false, reason: 'not-browser-tab' };
+    const normalized = normalizeBrowserUrl(value, { allowBlank, allowProtocolLess: true });
+    if (!normalized) {
+      setBrowserStatus(tab, 'Invalid URL (HTTP/HTTPS only).', 'error');
+      return { ok: false, reason: 'invalid-url' };
+    }
+    tab.browser.url = normalized;
+    tab.browser.requestedUrl = normalized;
+    tab.browser.urlInputEl.value = normalized === 'about:blank' ? '' : normalized;
+    setBrowserStatus(tab, '');
+    applyBrowserTabAutoTitle(tab, { url: normalized });
+    try {
+      tab.browser.webviewEl.src = normalized;
+      return { ok: true, url: normalized };
+    } catch (error) {
+      setBrowserStatus(tab, 'Failed to load URL.', 'error');
+      return { ok: false, reason: 'load-failed', error };
+    }
+  };
+
+  const reloadBrowserTab = (tab) => {
+    if (!tab || tab.type !== 'browser') return false;
+    const webviewEl = tab.browser?.webviewEl;
+    if (!webviewEl) return false;
+    try {
+      if (!tab.browser.url || tab.browser.url === 'about:blank') {
+        webviewEl.src = 'about:blank';
+      } else if (typeof webviewEl.reload === 'function') {
+        webviewEl.reload();
+      } else {
+        webviewEl.src = tab.browser.url;
+      }
+      setBrowserStatus(tab, '');
+      return true;
+    } catch (_) {
+      setBrowserStatus(tab, 'Reload failed.', 'error');
+      return false;
+    }
+  };
+
+  const createBrowserTabContent = (tab, { url } = {}) => {
+    if (!tab?.container) return null;
+    const initialUrl = normalizeBrowserUrl(url, { allowBlank: true, allowProtocolLess: true }) || 'about:blank';
+    tab.container.classList.add('browser-instance');
+    const root = document.createElement('div');
+    root.className = 'browser-tab-root';
+
+    const toolbar = document.createElement('div');
+    toolbar.className = 'browser-tab-toolbar';
+
+    const urlInputEl = document.createElement('input');
+    urlInputEl.className = 'browser-tab-url-input';
+    urlInputEl.type = 'text';
+    urlInputEl.placeholder = 'Enter URL (https://...)';
+    urlInputEl.spellcheck = false;
+    urlInputEl.autocomplete = 'off';
+
+    const goBtn = document.createElement('button');
+    goBtn.className = 'browser-tab-btn';
+    goBtn.type = 'button';
+    goBtn.textContent = 'Go';
+
+    const reloadBtn = document.createElement('button');
+    reloadBtn.className = 'browser-tab-btn';
+    reloadBtn.type = 'button';
+    reloadBtn.textContent = 'Reload';
+
+    const statusEl = document.createElement('div');
+    statusEl.className = 'browser-tab-status';
+
+    const body = document.createElement('div');
+    body.className = 'browser-tab-body';
+
+    const webviewEl = document.createElement('webview');
+    webviewEl.className = 'browser-tab-webview';
+    webviewEl.setAttribute('partition', 'persist:kawaii-terminal-browser');
+
+    body.appendChild(webviewEl);
+    toolbar.appendChild(urlInputEl);
+    toolbar.appendChild(goBtn);
+    toolbar.appendChild(reloadBtn);
+    toolbar.appendChild(statusEl);
+    root.appendChild(toolbar);
+    root.appendChild(body);
+    tab.container.appendChild(root);
+
+    const browserState = {
+      root,
+      toolbar,
+      body,
+      webviewEl,
+      urlInputEl,
+      goBtn,
+      reloadBtn,
+      statusEl,
+      url: initialUrl,
+      requestedUrl: initialUrl,
+      pageTitle: '',
+      loading: false,
+    };
+    tab.browser = browserState;
+
+    const commitInputUrl = () => {
+      const result = loadBrowserUrlInTab(tab, urlInputEl.value, { allowBlank: true });
+      return result.ok;
+    };
+
+    urlInputEl.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      commitInputUrl();
+    });
+    urlInputEl.addEventListener('focus', () => {
+      urlInputEl.select();
+    });
+    goBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      commitInputUrl();
+    });
+    reloadBtn.addEventListener('click', (event) => {
+      event.preventDefault();
+      reloadBrowserTab(tab);
+    });
+
+    webviewEl.addEventListener('did-start-loading', () => {
+      browserState.loading = true;
+      tab.tabEl?.classList.add('browser-loading');
+      setBrowserStatus(tab, 'Loading...');
+    });
+    webviewEl.addEventListener('did-stop-loading', () => {
+      browserState.loading = false;
+      tab.tabEl?.classList.remove('browser-loading');
+      try {
+        const currentUrl = normalizeBrowserUrl(webviewEl.getURL?.(), { allowBlank: true, allowProtocolLess: false });
+        if (currentUrl) {
+          const preferRequested = currentUrl === 'about:blank'
+            && browserState.loading === false
+            && browserState.requestedUrl
+            && browserState.requestedUrl !== 'about:blank';
+          const effectiveUrl = preferRequested ? browserState.requestedUrl : currentUrl;
+          browserState.url = effectiveUrl;
+          urlInputEl.value = effectiveUrl === 'about:blank' ? '' : effectiveUrl;
+          applyBrowserTabAutoTitle(tab, { pageTitle: browserState.pageTitle, url: effectiveUrl });
+        }
+      } catch (_) { /* noop */ }
+      setBrowserStatus(tab, '');
+    });
+    webviewEl.addEventListener('did-fail-load', (event) => {
+      if (Number(event?.errorCode) === -3) return; // ERR_ABORTED during redirects/navigation changes
+      browserState.loading = false;
+      tab.tabEl?.classList.remove('browser-loading');
+      const msg = String(event?.errorDescription || 'Page load failed').trim();
+      setBrowserStatus(tab, msg, 'error');
+    });
+    webviewEl.addEventListener('did-navigate', (event) => {
+      const nextUrl = typeof event?.url === 'string' ? event.url : '';
+      const normalized = normalizeBrowserUrl(nextUrl, { allowBlank: true, allowProtocolLess: false });
+      if (!normalized) return;
+      if (normalized === 'about:blank' && browserState.requestedUrl && browserState.requestedUrl !== 'about:blank') {
+        return;
+      }
+      browserState.url = normalized;
+      if (normalized !== 'about:blank' || browserState.requestedUrl === 'about:blank') {
+        browserState.requestedUrl = normalized;
+      }
+      urlInputEl.value = normalized === 'about:blank' ? '' : normalized;
+      applyBrowserTabAutoTitle(tab, { pageTitle: browserState.pageTitle, url: normalized });
+    });
+    webviewEl.addEventListener('did-navigate-in-page', (event) => {
+      const nextUrl = typeof event?.url === 'string' ? event.url : '';
+      const normalized = normalizeBrowserUrl(nextUrl, { allowBlank: true, allowProtocolLess: false });
+      if (!normalized) return;
+      if (normalized === 'about:blank' && browserState.requestedUrl && browserState.requestedUrl !== 'about:blank') {
+        return;
+      }
+      browserState.url = normalized;
+      if (normalized !== 'about:blank' || browserState.requestedUrl === 'about:blank') {
+        browserState.requestedUrl = normalized;
+      }
+      urlInputEl.value = normalized === 'about:blank' ? '' : normalized;
+      applyBrowserTabAutoTitle(tab, { pageTitle: browserState.pageTitle, url: normalized });
+    });
+    webviewEl.addEventListener('page-title-updated', (event) => {
+      const titleText = String(event?.title || '').trim();
+      browserState.pageTitle = titleText;
+      applyBrowserTabAutoTitle(tab, { pageTitle: titleText, url: browserState.url });
+    });
+    webviewEl.addEventListener('new-window', (event) => {
+      event.preventDefault?.();
+      const targetUrl = typeof event?.url === 'string' ? event.url : '';
+      const normalized = normalizeBrowserUrl(targetUrl, { allowBlank: false, allowProtocolLess: false });
+      if (normalized) {
+        void openUrlInBrowserTab(normalized, { activate: true });
+      }
+    });
+
+    applyBrowserTabAutoTitle(tab, { url: initialUrl });
+    if (initialUrl !== 'about:blank') {
+      loadBrowserUrlInTab(tab, initialUrl, { allowBlank: true });
+    }
+    return browserState;
+  };
+
   const resolvePaneProfileId = (pane, tab) => {
     if (pane?.profileId) return pane.profileId;
     if (pane?.terminalManager?.profileId) return pane.terminalManager.profileId;
@@ -349,6 +635,11 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
   const syncTabStatusIndicator = (tab) => {
     if (!tab?.statusDotEl) return;
+    if (tab.type === 'browser') {
+      tab.statusDotEl.classList.remove('is-visible', 'status-working', 'status-waiting_user', 'status-completed', 'is-unread');
+      tab?.tabEl?.classList.remove('has-unread-completion');
+      return;
+    }
     const dot = tab.statusDotEl;
     const info = getTabStatusInfo(tab);
     const status = info.status;
@@ -695,7 +986,24 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   const buildTabDragPayload = (tabId) => {
     const tab = tabs.get(tabId);
     if (!tab) return null;
-    const title = tab.customTitle || tab.autoTitle || tab.titleEl.textContent || `Terminal ${tab.index}`;
+    const title = tab.customTitle || tab.autoTitle || tab.titleEl.textContent || (tab.type === 'browser' ? 'Browser' : `Terminal ${tab.index}`);
+    if (tab.type === 'browser') {
+      const browserUrl = getBrowserTabTransferUrl(tab);
+      return {
+        tabId,
+        type: 'browser',
+        title,
+        customTitle: Boolean(tab.customTitle),
+        snapshot: '',
+        sourceWindowId: windowId,
+        splitLayout: null,
+        panes: [],
+        activePaneId: null,
+        browser: {
+          url: browserUrl,
+        },
+      };
+    }
     const panes = Array.from(tab.panes.values()).map((pane) => {
       let paneSnapshot = '';
       try {
@@ -718,6 +1026,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     }
     return {
       tabId,
+      type: 'terminal',
       title,
       customTitle: Boolean(tab.customTitle),
       snapshot,
@@ -786,12 +1095,14 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     const titlebarHeight = document.getElementById('titlebar')?.getBoundingClientRect?.().height || 44;
     if (USE_NATIVE_GHOST_WINDOW) {
       window.windowAPI?.tabDragStart?.({
+        type: payload.type === 'browser' ? 'browser' : 'terminal',
         title: payload.title,
         customTitle: payload.customTitle,
         snapshot: payload.snapshot,
         panes: payload.panes,
         splitLayout: payload.splitLayout,
         activePaneId: payload.activePaneId,
+        browser: payload.browser || null,
         width: window.outerWidth,
         height: window.outerHeight,
         offsetX: event.screenX - window.screenX,
@@ -1948,6 +2259,19 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
     const terminalManager = new TerminalManager(contentEl, paneId);
     terminalManager.setMdPreviewManager?.(mdPreviewManager);
+    terminalManager.setHttpUrlOpener?.(async (url) => {
+      const normalized = normalizeBrowserUrl(url, { allowBlank: false, allowProtocolLess: false });
+      if (!normalized) {
+        showTabPaneToast(tab.tabId, 'Invalid URL. Opening in external browser.', { tone: 'error' });
+        return false;
+      }
+      const result = await openUrlInBrowserTab(normalized, { activate: true });
+      if (!result?.ok) {
+        showTabPaneToast(tab.tabId, 'Failed to open browser tab. Opening in external browser.', { tone: 'error' });
+        return false;
+      }
+      return true;
+    });
     const resolvedStartCwd = startCwd || sourceCwd || null;
       await terminalManager.initialize({
         attachExisting,
@@ -2141,6 +2465,10 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     historyManager?.setActiveTab?.(tabId);
     historyManager?.setActiveTabLabel?.(target.titleEl?.textContent || tabId);
     markTabViewed(target);
+    if (target.type === 'browser') {
+      target.browser?.urlInputEl?.blur?.();
+      return;
+    }
     const paneId = target.activePaneId || Array.from(target.panes.keys())[0];
     if (paneId) {
       setActivePane(target, paneId);
@@ -2163,6 +2491,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   const createTab = async (options = {}) => {
     if (isCreating) return null;
     const {
+      type: requestedType = 'terminal',
       activate = true,
       tabId: providedId,
       attachExisting = false,
@@ -2179,7 +2508,10 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       deferPtyStart = false,
       initialSettings = null,
       deferXtermOpen = false,
+      browser: browserPayload = null,
     } = options;
+    const type = requestedType === 'browser' ? 'browser' : 'terminal';
+    const browserUrl = typeof browserPayload?.url === 'string' ? browserPayload.url : '';
     const effectiveInitialSettings = initialSettings || settingsSnapshot || null;
     isCreating = true;
     try {
@@ -2192,12 +2524,20 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       container.style.display = 'none';
       stack.appendChild(container);
 
-      const paneRoot = document.createElement('div');
-      paneRoot.className = 'terminal-pane-root';
-      container.appendChild(paneRoot);
+      let paneRoot = null;
+      if (type === 'terminal') {
+        paneRoot = document.createElement('div');
+        paneRoot.className = 'terminal-pane-root';
+        container.appendChild(paneRoot);
+      } else {
+        container.classList.add('browser-instance');
+      }
 
       const tabEl = document.createElement('div');
       tabEl.className = 'terminal-tab';
+      if (type === 'browser') {
+        tabEl.classList.add('browser');
+      }
       tabEl.dataset.tabId = tabId;
 
       const statusDotEl = document.createElement('span');
@@ -2205,7 +2545,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
       const titleEl = document.createElement('span');
       titleEl.className = 'terminal-tab-title';
-      titleEl.textContent = title || `Terminal ${tabCounter}`;
+      titleEl.textContent = title || (type === 'browser' ? getBrowserTitleFromUrl(browserUrl) : `Terminal ${tabCounter}`);
 
       const wslBadgeEl = document.createElement('span');
       wslBadgeEl.className = 'terminal-tab-wsl';
@@ -2266,6 +2606,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
       const tab = {
         tabId,
+        type,
         container,
         tabEl,
         titleEl,
@@ -2275,6 +2616,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
         splitIndicatorEl: splitIndicator,
         paneRoot,
         panes: new Map(),
+        browser: null,
         paneCounter: 0,
         paneTree: null,
         activePaneId: null,
@@ -2289,7 +2631,10 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
       tabs.set(tabId, tab);
 
-      if (paneLayout && Array.isArray(panePayloads) && panePayloads.length > 0) {
+      if (type === 'browser') {
+        createBrowserTabContent(tab, { url: browserUrl || 'about:blank' });
+        updateTabWslIndicator(tab);
+      } else if (paneLayout && Array.isArray(panePayloads) && panePayloads.length > 0) {
         for (const panePayload of panePayloads) {
           const allowPrefill = !restoreSession || restorePrefillEnabled;
           await createPane(tab, {
@@ -2448,9 +2793,23 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       activateTab(payload.tabId);
       return payload.tabId;
     }
+    if (payload?.type === 'browser') {
+      return await createTab({
+        type: 'browser',
+        tabId: payload.tabId,
+        activate: true,
+        title: payload.title,
+        customTitle: Boolean(payload.customTitle),
+        insertBeforeEl,
+        browser: {
+          url: payload?.browser?.url || 'about:blank',
+        },
+      });
+    }
     const paneLayout = normalizePaneLayout(payload.splitLayout);
     const panePayloads = Array.isArray(payload.panes) ? payload.panes : null;
     return await createTab({
+      type: 'terminal',
       tabId: payload.tabId,
       activate: true,
       attachExisting: true,
@@ -2474,6 +2833,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   const newTab = ({ profileId = null, title, insertBeforeEl, startCwd: requestedCwd } = {}) => {
     const startCwd = requestedCwd || getStartCwdForNewTab(profileId);
     return createTab({
+      type: 'terminal',
       activate: true,
       title,
       startCwd,
@@ -2481,6 +2841,35 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       insertBeforeEl,
       initialSettings: settingsSnapshot,
     });
+  };
+
+  const newBrowserTab = ({ url, title, insertBeforeEl, activate = true } = {}) => {
+    return createTab({
+      type: 'browser',
+      activate,
+      title,
+      insertBeforeEl,
+      browser: { url: typeof url === 'string' ? url : 'about:blank' },
+    });
+  };
+
+  const openUrlInBrowserTab = async (url, { activate = true, insertBeforeEl, title } = {}) => {
+    const normalized = normalizeBrowserUrl(url, { allowBlank: false, allowProtocolLess: true });
+    if (!normalized) {
+      return { ok: false, reason: 'invalid-url' };
+    }
+    try {
+      const tabId = await newBrowserTab({
+        url: normalized,
+        title: title || getBrowserTitleFromUrl(normalized),
+        insertBeforeEl,
+        activate,
+      });
+      if (!tabId) return { ok: false, reason: 'create-tab-failed' };
+      return { ok: true, tabId, url: normalized };
+    } catch (error) {
+      return { ok: false, reason: 'create-tab-failed', error };
+    }
   };
   const closeActiveTab = () => {
     if (activeTabId) {
@@ -2628,6 +3017,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   const canSplitActivePane = (direction) => {
     const tab = getActiveTab();
     if (!tab) return false;
+    if (tab.type !== 'terminal') return false;
     const paneId = tab.activePaneId;
     return canSplitPane(tab, paneId, direction);
   };
@@ -2635,6 +3025,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   const splitActivePane = async (direction, side = 'after') => {
     const tab = getActiveTab();
     if (!tab) return null;
+    if (tab.type !== 'terminal') return null;
     const paneId = tab.activePaneId;
     return await splitPane(tab, paneId, direction, side);
   };
@@ -2642,12 +3033,14 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   const canCloseActivePane = () => {
     const tab = getActiveTab();
     if (!tab) return false;
+    if (tab.type !== 'terminal') return false;
     return (tab.panes?.size || 0) > 0;
   };
 
   const closeActivePane = async () => {
     const tab = getActiveTab();
     if (!tab) return;
+    if (tab.type !== 'terminal') return;
     const paneId = tab.activePaneId;
     if (!paneId) return;
     await closePane(tab, paneId);
@@ -2674,8 +3067,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   if (profileBtn && profileMenu) {
     const PROFILE_CACHE_MS = 3000;
     const profileState = { profiles: [], fetchedAt: 0, pending: null };
-    profileBtn.classList.add('hidden');
-    profileBtn.disabled = true;
+    profileBtn.classList.remove('hidden');
+    profileBtn.disabled = false;
 
     const normalizeProfiles = (profiles) => {
       const list = Array.isArray(profiles) ? profiles : [];
@@ -2714,9 +3107,9 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     };
 
     const setProfileButtonState = (profiles) => {
-      const show = Array.isArray(profiles) && profiles.length > 1;
-      profileBtn.classList.toggle('hidden', !show);
-      profileBtn.disabled = !show;
+      void profiles;
+      profileBtn.classList.remove('hidden');
+      profileBtn.disabled = false;
     };
 
     const hideProfileMenu = () => {
@@ -2725,6 +3118,24 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
     const buildProfileMenu = (profiles) => {
       profileMenu.innerHTML = '';
+      const browserItem = document.createElement('div');
+      browserItem.className = 'tab-menu-item';
+      browserItem.textContent = 'New Browser Tab';
+      browserItem.dataset.action = 'new-browser-tab';
+      browserItem.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        hideProfileMenu();
+        newBrowserTab({ activate: true });
+      });
+      profileMenu.appendChild(browserItem);
+
+      if (Array.isArray(profiles) && profiles.length > 0) {
+        const divider = document.createElement('div');
+        divider.className = 'tab-menu-divider';
+        profileMenu.appendChild(divider);
+      }
+
       for (const profile of profiles) {
         const item = document.createElement('div');
         item.className = 'tab-menu-item';
@@ -2747,7 +3158,6 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     const showProfileMenu = async () => {
       const profiles = await loadProfiles(true);
       setProfileButtonState(profiles);
-      if (!profiles || profiles.length <= 1) return;
       buildProfileMenu(profiles);
       profileMenu.classList.add('show');
       const rect = profileMenu.getBoundingClientRect();
@@ -2873,6 +3283,21 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     for (const tabId of ordered) {
       const tab = tabs.get(tabId);
       if (!tab) continue;
+      if (tab.type === 'browser') {
+        tabsOut.push({
+          tabId: tab.tabId,
+          type: 'browser',
+          title: tab.titleEl?.textContent || tab.autoTitle || 'Browser',
+          customTitle: Boolean(tab.customTitle),
+          activePaneId: null,
+          paneLayout: null,
+          panes: [],
+          browser: {
+            url: getBrowserTabTransferUrl(tab),
+          },
+        });
+        continue;
+      }
         const panesOut = Array.from(tab.panes.values()).map((pane) => ({
           paneId: pane.paneId,
           title: pane.titleEl?.textContent || 'Terminal',
@@ -2881,6 +3306,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
         }));
       tabsOut.push({
         tabId: tab.tabId,
+        type: 'terminal',
         title: tab.titleEl?.textContent || `Terminal ${tab.index}`,
         customTitle: Boolean(tab.customTitle),
         activePaneId: tab.activePaneId || null,
@@ -2935,9 +3361,24 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       : initialSession.tabs[0]?.tabId;
     for (const tabPayload of initialSession.tabs) {
       if (!tabPayload?.tabId) continue;
+      const tabType = tabPayload?.type === 'browser' ? 'browser' : 'terminal';
+      if (tabType === 'browser') {
+        await createTab({
+          type: 'browser',
+          tabId: tabPayload.tabId,
+          activate: false,
+          title: tabPayload.title,
+          customTitle: Boolean(tabPayload.customTitle),
+          browser: {
+            url: tabPayload?.browser?.url || 'about:blank',
+          },
+        });
+        continue;
+      }
       const paneLayout = tabPayload.paneLayout || null;
       const panePayloads = Array.isArray(tabPayload.panes) ? tabPayload.panes : null;
       await createTab({
+        type: 'terminal',
         tabId: tabPayload.tabId,
         activate: false,
         attachExisting: false,
@@ -2981,6 +3422,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
 
   tabManager = {
     newTab,
+    newBrowserTab,
+    openUrlInBrowserTab,
     closeActiveTab,
     nextTab,
     previousTab,
