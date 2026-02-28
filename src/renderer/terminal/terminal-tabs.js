@@ -380,7 +380,9 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     tab.autoTitle = nextTitle || 'Browser';
     if (!tab.customTitle && tab.titleEl) {
       tab.titleEl.textContent = tab.autoTitle;
-      historyManager?.setActiveTabLabel?.(tab.titleEl.textContent || tab.tabId);
+      if (tab.tabId === activeTabId) {
+        historyManager?.setActiveTabLabel?.(tab.titleEl.textContent || tab.tabId);
+      }
     }
   };
 
@@ -3536,6 +3538,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     historyManager?.setActiveTabLabel?.(target.titleEl?.textContent || tabId);
     markTabViewed(target);
     if (target.type === 'browser') {
+      pinManager?.setActivePane?.(null, null);
+      historyManager?.setActivePane?.(null, null);
       target.browser?.urlInputEl?.blur?.();
       return;
     }
