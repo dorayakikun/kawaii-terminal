@@ -54,7 +54,7 @@
     return cloneEmptyZone();
   };
 
-  const getPaneDropZone = (rect, clientX, clientY) => {
+  const resolveZone = (rect, clientX, clientY, { allowOutside = false } = {}) => {
     const normalized = normalizeRect(rect);
     if (!normalized) return cloneEmptyZone();
 
@@ -66,7 +66,7 @@
       left, top, right, bottom, width, height,
     } = normalized;
 
-    if (x < left || x > right || y < top || y > bottom) {
+    if (!allowOutside && (x < left || x > right || y < top || y > bottom)) {
       return cloneEmptyZone();
     }
 
@@ -87,8 +87,13 @@
     return zoneFromDirection(dy < 0 ? 'top' : 'bottom');
   };
 
+  const getPaneDropZone = (rect, clientX, clientY) => resolveZone(rect, clientX, clientY, { allowOutside: false });
+
+  const getPaneDropZoneWithOutside = (rect, clientX, clientY) => resolveZone(rect, clientX, clientY, { allowOutside: true });
+
   return {
     EMPTY_ZONE,
     getPaneDropZone,
+    getPaneDropZoneWithOutside,
   };
 }));

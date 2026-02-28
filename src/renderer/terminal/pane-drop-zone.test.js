@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { getPaneDropZone } = require('./pane-drop-zone.js');
+const { getPaneDropZone, getPaneDropZoneWithOutside } = require('./pane-drop-zone.js');
 
 const rect = {
   left: 100,
@@ -69,4 +69,32 @@ test('getPaneDropZone: exact center stays neutral', () => {
     splitDirection: null,
     inDeadZone: false,
   });
+});
+
+test('getPaneDropZoneWithOutside: chooses left for point outside left', () => {
+  const zone = getPaneDropZoneWithOutside(rect, 40, 300);
+  assert.equal(zone.direction, 'left');
+  assert.equal(zone.side, 'before');
+  assert.equal(zone.splitDirection, 'row');
+});
+
+test('getPaneDropZoneWithOutside: chooses right for point outside right', () => {
+  const zone = getPaneDropZoneWithOutside(rect, 560, 300);
+  assert.equal(zone.direction, 'right');
+  assert.equal(zone.side, 'after');
+  assert.equal(zone.splitDirection, 'row');
+});
+
+test('getPaneDropZoneWithOutside: chooses top for point outside top', () => {
+  const zone = getPaneDropZoneWithOutside(rect, 300, 120);
+  assert.equal(zone.direction, 'top');
+  assert.equal(zone.side, 'before');
+  assert.equal(zone.splitDirection, 'col');
+});
+
+test('getPaneDropZoneWithOutside: chooses bottom for point outside bottom', () => {
+  const zone = getPaneDropZoneWithOutside(rect, 300, 480);
+  assert.equal(zone.direction, 'bottom');
+  assert.equal(zone.side, 'after');
+  assert.equal(zone.splitDirection, 'col');
 });

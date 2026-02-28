@@ -207,6 +207,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     paneDropOverlayEl: null,
     mergeInProgress: false,
     mergeCommitted: false,
+    guidedMode: false,
+    guidedTargetTabId: null,
   };
 
   const updateTabsLayout = () => {
@@ -1455,6 +1457,86 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     return tab.panes?.size || 0;
   };
 
+  const tabMergeLayout = window.KawaiiTabMergeLayout || {};
+  const clampMergeRatio = typeof tabMergeLayout.clampRatio === 'function'
+    ? tabMergeLayout.clampRatio
+    : (ratio) => {
+      const value = Number(ratio);
+      if (!Number.isFinite(value)) return 0.5;
+      return Math.max(0.1, Math.min(0.9, value));
+    };
+
+  const getGuidedSplitConfig = (direction) => {
+    const helper = tabMergeLayout.getGuidedSplitConfig;
+    if (typeof helper === 'function') {
+      return helper(direction);
+    }
+    if (direction === 'left') return { splitDirection: 'row', side: 'after', activeSide: 'left' };
+    if (direction === 'right') return { splitDirection: 'row', side: 'before', activeSide: 'right' };
+    if (direction === 'top') return { splitDirection: 'col', side: 'after', activeSide: 'top' };
+    if (direction === 'bottom') return { splitDirection: 'col', side: 'before', activeSide: 'bottom' };
+    return null;
+  };
+
+  const buildLinearLayoutFromSegments = (segments, splitDirection) => {
+    const helper = tabMergeLayout.buildLinearLayoutFromSegments;
+    if (typeof helper === 'function') {
+      return helper(segments, splitDirection);
+    }
+    const list = Array.isArray(segments)
+      ? segments.filter((segment) => segment?.node && Number(segment?.paneCount) > 0)
+      : [];
+    if (!list.length) return { node: null, paneCount: 0 };
+    const direction = splitDirection === 'col' ? 'col' : 'row';
+    let accNode = list[0].node;
+    let accPaneCount = Number(list[0].paneCount);
+    for (let i = 1; i < list.length; i += 1) {
+      const next = list[i];
+      const nextCount = Number(next.paneCount);
+      const total = accPaneCount + nextCount;
+      accNode = {
+        type: 'split',
+        direction,
+        ratio: clampMergeRatio(accPaneCount / total),
+        a: accNode,
+        b: next.node,
+      };
+      accPaneCount = total;
+    }
+    return { node: accNode, paneCount: accPaneCount };
+  };
+
+  const buildGuidedRootSplit = ({ activeNode, activePaneCount, oppositeNode, oppositePaneCount, splitDirection, side } = {}) => {
+    const helper = tabMergeLayout.buildGuidedRootSplit;
+    if (typeof helper === 'function') {
+      return helper({ activeNode, activePaneCount, oppositeNode, oppositePaneCount, splitDirection, side });
+    }
+    if (!activeNode || !oppositeNode) return null;
+    const activeCount = Number(activePaneCount);
+    const oppositeCount = Number(oppositePaneCount);
+    if (!(activeCount > 0) || !(oppositeCount > 0)) return null;
+    const total = activeCount + oppositeCount;
+    const oppositeBefore = side === 'before';
+    const a = oppositeBefore ? oppositeNode : activeNode;
+    const b = oppositeBefore ? activeNode : oppositeNode;
+    const aPaneCount = oppositeBefore ? oppositeCount : activeCount;
+    return {
+      type: 'split',
+      direction: splitDirection === 'col' ? 'col' : 'row',
+      ratio: clampMergeRatio(aPaneCount / total),
+      a,
+      b,
+    };
+  };
+
+  const willExceedMaxPanes = ({ activePaneCount, oppositePaneCount, maxPanes } = {}) => {
+    const helper = tabMergeLayout.willExceedMaxPanes;
+    if (typeof helper === 'function') {
+      return helper({ activePaneCount, oppositePaneCount, maxPanes });
+    }
+    return Number(activePaneCount) + Number(oppositePaneCount) > Number(maxPanes);
+  };
+
   const canSplitRect = (rect, direction) => {
     if (!rect) return false;
     if (direction === 'row') return rect.width >= MIN_PANE_WIDTH * 2;
@@ -1486,16 +1568,18 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     }, TAB_SPRING_LOAD_DELAY_MS);
   };
 
-  // Half-based split hit testing keeps the guide and actual split ratio consistent (50/50).
-  const getPaneDropZone = (rect, clientX, clientY) => {
-    const helper = window.KawaiiPaneDropZone?.getPaneDropZone;
+  // Half-based split hit testing keeps the guide and actual split ratio consistent.
+  const getPaneDropZone = (rect, clientX, clientY, { allowOutside = false } = {}) => {
+    const helper = allowOutside
+      ? window.KawaiiPaneDropZone?.getPaneDropZoneWithOutside
+      : window.KawaiiPaneDropZone?.getPaneDropZone;
     if (typeof helper === 'function') {
       return helper(rect, clientX, clientY);
     }
     if (!rect || !rect.width || !rect.height) {
       return { direction: null, side: null, splitDirection: null, inDeadZone: false };
     }
-    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+    if (!allowOutside && (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom)) {
       return { direction: null, side: null, splitDirection: null, inDeadZone: false };
     }
     const centerX = rect.left + rect.width / 2;
@@ -1523,7 +1607,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     return { host, rect };
   };
 
-  const findTabPaneDropTarget = (clientX, clientY) => {
+  const findLegacyTabPaneDropTarget = (clientX, clientY) => {
     const sourceTabId = dragState.tabId;
     const payload = dragState.payload;
     if (!sourceTabId || !payload) return null;
@@ -1546,6 +1630,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       const zone = getPaneDropZone(rect, clientX, clientY);
       const valid = Boolean(zone.direction && !exceedsMax && canSplitRect(rect, zone.splitDirection));
       return {
+        mode: 'legacy',
         tabId: targetTab.tabId,
         paneId: null,
         legacyBrowserTarget: true,
@@ -1571,6 +1656,7 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       && canSplitPane(targetTab, foundPane.pane.paneId, zone.splitDirection)
     );
     return {
+      mode: 'legacy',
       tabId: targetTab.tabId,
       paneId: foundPane.pane.paneId,
       legacyBrowserTarget: false,
@@ -1580,7 +1666,93 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     };
   };
 
+  const findGuidedTabPaneDropTarget = (clientX, clientY) => {
+    const sourceTabId = dragState.tabId;
+    const targetTabId = dragState.guidedTargetTabId;
+    if (!sourceTabId || !targetTabId) return null;
+    if (sourceTabId !== targetTabId) return null;
+    const targetTab = tabs.get(targetTabId);
+    if (!targetTab) return null;
+
+    let targetPaneId = null;
+    let targetRect = null;
+    let zone = null;
+    let splitable = false;
+    let legacyBrowserTarget = false;
+
+    if (targetTab.type === 'browser') {
+      const host = getLegacyBrowserDropHostRect(targetTab);
+      if (!host) return null;
+      legacyBrowserTarget = true;
+      targetRect = host.rect;
+      zone = getPaneDropZone(targetRect, clientX, clientY, { allowOutside: true });
+      const config = getGuidedSplitConfig(zone.direction);
+      splitable = Boolean(config && canSplitRect(targetRect, config.splitDirection));
+    } else {
+      const activePane = targetTab.activePaneId
+        ? targetTab.panes.get(targetTab.activePaneId)
+        : Array.from(targetTab.panes.values())[0];
+      const rect = activePane?.paneEl?.getBoundingClientRect?.();
+      if (!activePane || !rect || !rect.width || !rect.height) return null;
+      targetPaneId = activePane.paneId;
+      targetRect = rect;
+      zone = getPaneDropZone(targetRect, clientX, clientY, { allowOutside: true });
+      const config = getGuidedSplitConfig(zone.direction);
+      splitable = Boolean(config && canSplitPane(targetTab, targetPaneId, config.splitDirection));
+    }
+
+    if (!targetRect || !zone) return null;
+    const splitConfig = getGuidedSplitConfig(zone.direction);
+    const inactiveTabIds = getOrderedTabIds().filter((id) => id && id !== targetTabId && tabs.has(id));
+    const inactivePaneCount = inactiveTabIds.reduce((total, tabId) => total + getTabPaneCountForMerge(tabs.get(tabId)), 0);
+    const targetPaneCount = getTabPaneCountForMerge(targetTab);
+    const hasInactiveTabs = inactiveTabIds.length > 0;
+    const exceedsMax = willExceedMaxPanes({
+      activePaneCount: targetPaneCount,
+      oppositePaneCount: inactivePaneCount,
+      maxPanes: MAX_PANES,
+    });
+    let reason = '';
+    if (!splitConfig || !zone.direction) {
+      reason = 'invalid-direction';
+    } else if (!hasInactiveTabs) {
+      reason = 'no-inactive-tabs';
+    } else if (exceedsMax) {
+      reason = 'pane-limit';
+    } else if (!splitable) {
+      reason = 'cannot-split';
+    }
+    const valid = !reason;
+    return {
+      mode: 'guided',
+      tabId: targetTab.tabId,
+      paneId: targetPaneId,
+      legacyBrowserTarget,
+      rect: targetRect,
+      valid,
+      reason,
+      inactiveTabIds,
+      inactivePaneCount,
+      targetPaneCount,
+      direction: zone.direction,
+      splitDirection: splitConfig?.splitDirection || null,
+      side: splitConfig?.side || null,
+      inDeadZone: Boolean(zone?.inDeadZone),
+    };
+  };
+
+  const findTabPaneDropTarget = (clientX, clientY) => {
+    if (dragState.guidedMode) {
+      return findGuidedTabPaneDropTarget(clientX, clientY);
+    }
+    return findLegacyTabPaneDropTarget(clientX, clientY);
+  };
+
   const updateSpringLoadHover = (clientX, clientY) => {
+    if (dragState.guidedMode) {
+      clearSpringLoadTimer();
+      return;
+    }
     const barRect = tabsBar.getBoundingClientRect();
     const inBar = clientX >= barRect.left && clientX <= barRect.right && clientY >= barRect.top && clientY <= barRect.bottom;
     if (!inBar) {
@@ -1611,6 +1783,14 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
   };
 
   const updateTabPaneDropHover = (clientX, clientY) => {
+    const withinWindow = clientX >= 0
+      && clientY >= 0
+      && clientX <= window.innerWidth
+      && clientY <= window.innerHeight;
+    if (!withinWindow) {
+      hideTabPaneDropOverlay();
+      return;
+    }
     const barRect = tabsBar.getBoundingClientRect();
     const inBar = clientX >= barRect.left - 4 && clientX <= barRect.right + 4 && clientY >= barRect.top - 4 && clientY <= barRect.bottom + 4;
     if (inBar) {
@@ -1676,14 +1856,14 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     });
   };
 
-  const insertSubtreeAtPane = (tab, targetPaneId, subtree, splitDirection, side) => {
+  const insertSubtreeAtPane = (tab, targetPaneId, subtree, splitDirection, side, ratio = 0.5) => {
     const target = findPaneNode(tab?.paneTree, targetPaneId);
     if (!target) return false;
     const oldNode = target.node;
     const splitNode = {
       type: 'split',
       direction: splitDirection,
-      ratio: 0.5,
+      ratio: clampMergeRatio(ratio),
       a: side === 'before' ? subtree : oldNode,
       b: side === 'before' ? oldNode : subtree,
     };
@@ -1695,6 +1875,135 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
       target.parent.b = splitNode;
     }
     return true;
+  };
+
+  const getGuidedSplitErrorMessage = (reason) => {
+    if (reason === 'no-inactive-tabs') return 'No inactive tabs to split';
+    if (reason === 'pane-limit') return `Cannot split: pane limit (${MAX_PANES}) exceeded`;
+    if (reason === 'cannot-split') return 'Cannot split: active pane is too small';
+    if (reason === 'invalid-direction') return 'Choose left, right, top, or bottom to split';
+    return 'Failed to split tabs into panes';
+  };
+
+  const collectGuidedInactiveMergeSources = (targetTabId, providedTabIds) => {
+    const inactiveTabIds = Array.isArray(providedTabIds) && providedTabIds.length
+      ? providedTabIds.filter((tabId) => tabId && tabId !== targetTabId && tabs.has(tabId))
+      : getOrderedTabIds().filter((tabId) => tabId && tabId !== targetTabId && tabs.has(tabId));
+    const sources = [];
+    for (const tabId of inactiveTabIds) {
+      const payload = normalizeTabPayloadForPaneMerge(buildTabDragPayload(tabId));
+      if (!payload || !Array.isArray(payload.panes) || payload.panes.length === 0) {
+        return { ok: false, reason: 'invalid-payload', sources: [] };
+      }
+      const paneCount = payload.panes.length;
+      const layout = normalizePaneLayout(payload.splitLayout) || buildPaneNode(payload.panes[0].paneId);
+      sources.push({
+        tabId,
+        payload,
+        paneCount,
+        layout,
+      });
+    }
+    return { ok: true, sources };
+  };
+
+  const mergeInactiveTabsIntoGuidedTarget = async (paneDropTarget) => {
+    if (!paneDropTarget || paneDropTarget.mode !== 'guided') return false;
+    if (dragState.mergeInProgress) return false;
+    let targetTab = tabs.get(paneDropTarget.tabId);
+    if (!targetTab) return false;
+
+    dragState.mergeInProgress = true;
+    try {
+      if (targetTab.type === 'browser') {
+        convertLegacyBrowserTabToPaneBased(targetTab);
+        targetTab = tabs.get(paneDropTarget.tabId) || targetTab;
+      }
+      if (!targetTab || targetTab.type !== 'terminal') return false;
+      const targetPaneId = paneDropTarget.paneId || targetTab.activePaneId || Array.from(targetTab.panes.keys())[0];
+      if (!targetPaneId) {
+        showTabPaneToast(targetTab.tabId, getGuidedSplitErrorMessage('invalid-target'), { tone: 'error' });
+        return false;
+      }
+      const splitDirection = paneDropTarget.splitDirection;
+      const side = paneDropTarget.side;
+      if (!splitDirection || !side) {
+        showTabPaneToast(targetTab.tabId, getGuidedSplitErrorMessage('invalid-direction'), { tone: 'error' });
+        return false;
+      }
+      if (!canSplitPane(targetTab, targetPaneId, splitDirection)) {
+        showTabPaneToast(targetTab.tabId, getGuidedSplitErrorMessage('cannot-split'), { tone: 'error' });
+        return false;
+      }
+
+      const sourceCollection = collectGuidedInactiveMergeSources(targetTab.tabId, paneDropTarget.inactiveTabIds);
+      if (!sourceCollection.ok) {
+        showTabPaneToast(targetTab.tabId, getGuidedSplitErrorMessage(sourceCollection.reason), { tone: 'error' });
+        return false;
+      }
+      const sourceMerges = sourceCollection.sources;
+      if (!sourceMerges.length) {
+        showTabPaneToast(targetTab.tabId, getGuidedSplitErrorMessage('no-inactive-tabs'), { tone: 'error' });
+        return false;
+      }
+
+      const inactivePaneCount = sourceMerges.reduce((sum, entry) => sum + entry.paneCount, 0);
+      const targetPaneCount = getTabPaneCountForMerge(targetTab);
+      if (willExceedMaxPanes({ activePaneCount: targetPaneCount, oppositePaneCount: inactivePaneCount, maxPanes: MAX_PANES })) {
+        showTabPaneToast(targetTab.tabId, getGuidedSplitErrorMessage('pane-limit'), { tone: 'error' });
+        return false;
+      }
+
+      const oppositeTree = buildLinearLayoutFromSegments(
+        sourceMerges.map((entry) => ({ node: entry.layout, paneCount: entry.paneCount })),
+        splitDirection
+      );
+      if (!oppositeTree?.node || !(oppositeTree.paneCount > 0)) {
+        showTabPaneToast(targetTab.tabId, getGuidedSplitErrorMessage('invalid-layout'), { tone: 'error' });
+        return false;
+      }
+
+      for (const source of sourceMerges) {
+        await detachTab(source.tabId, { closeWindowOnEmpty: false });
+      }
+      for (const source of sourceMerges) {
+        for (const panePayload of source.payload.panes) {
+          await createPaneFromTransferPayload(targetTab, panePayload, { attachExisting: true });
+        }
+      }
+
+      const rootSplit = buildGuidedRootSplit({
+        activeNode: buildPaneNode(targetPaneId),
+        activePaneCount: 1,
+        oppositeNode: oppositeTree.node,
+        oppositePaneCount: oppositeTree.paneCount,
+        splitDirection,
+        side,
+      });
+      const fallbackRatio = side === 'before'
+        ? (oppositeTree.paneCount / (oppositeTree.paneCount + 1))
+        : (1 / (oppositeTree.paneCount + 1));
+      const ratio = Number.isFinite(rootSplit?.ratio) ? rootSplit.ratio : fallbackRatio;
+      if (!insertSubtreeAtPane(targetTab, targetPaneId, oppositeTree.node, splitDirection, side, ratio)) {
+        return false;
+      }
+      renderPaneTree(targetTab);
+      activateTab(targetTab.tabId);
+      const nextActivePaneId = targetPaneId && targetTab.panes.has(targetPaneId)
+        ? targetPaneId
+        : Array.from(targetTab.panes.keys())[0];
+      if (nextActivePaneId) {
+        setActivePane(targetTab, nextActivePaneId);
+      }
+      dragState.mergeCommitted = true;
+      return true;
+    } catch (error) {
+      console.error('[TabDnD] guided pane split failed', error);
+      showTabPaneToast(targetTab?.tabId || activeTabId, getGuidedSplitErrorMessage('unknown'), { tone: 'error' });
+      return false;
+    } finally {
+      dragState.mergeInProgress = false;
+    }
   };
 
   const mergeDraggedTabIntoPaneTarget = async (paneDropTarget) => {
@@ -1791,6 +2100,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     dragState.suppressClick = false;
     dragState.mergeCommitted = false;
     dragState.mergeInProgress = false;
+    dragState.guidedMode = tabId === activeTabId;
+    dragState.guidedTargetTabId = dragState.guidedMode ? activeTabId : null;
     clearSpringLoadTimer();
     hideTabPaneDropOverlay();
     dragState.tabEl.setPointerCapture?.(event.pointerId);
@@ -1917,10 +2228,18 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     const effectiveForceDetach = Boolean(dragState.forceDetach && !paneDropTarget?.valid);
     let handledLocally = false;
     if (dragState.dragging && paneDropTarget?.valid) {
-      handledLocally = await mergeDraggedTabIntoPaneTarget(paneDropTarget);
+      if (paneDropTarget.mode === 'guided') {
+        handledLocally = await mergeInactiveTabsIntoGuidedTarget(paneDropTarget);
+      } else {
+        handledLocally = await mergeDraggedTabIntoPaneTarget(paneDropTarget);
+      }
       if (!handledLocally) {
         handledLocally = true;
       }
+    } else if (dragState.dragging && paneDropTarget?.mode === 'guided' && !paneDropTarget.valid) {
+      const message = getGuidedSplitErrorMessage(paneDropTarget.reason);
+      showTabPaneToast(paneDropTarget.tabId || dragState.guidedTargetTabId || activeTabId, message, { tone: 'error' });
+      handledLocally = true;
     }
 
     if (dragState.dragging) {
@@ -1962,6 +2281,8 @@ async function initTerminalTabs(cheerManager, pinManager, historyManager, imageP
     dragState.lastReorderDirection = 0;
     dragState.reorderCandidate = null;
     dragState.sourceActiveTabId = null;
+    dragState.guidedMode = false;
+    dragState.guidedTargetTabId = null;
     clearSpringLoadTimer();
     hideTabPaneDropOverlay();
     if (dragState.moveRaf) {
