@@ -431,6 +431,7 @@ class TerminalManager {
     this.isOpen = false;
     this.deferOpen = false;
     this.pendingPrefill = null;
+    this.prefillAwaitAttachResult = false;
     this.hasOutput = false;
     this.lastInputAt = 0;
     this.lastOutputAt = 0;
@@ -833,6 +834,40 @@ class TerminalManager {
     return this.currentInput || '';
   }
 
+  clearPendingPrefill() {
+    this.pendingPrefill = null;
+    this.prefillCommitted = false;
+  }
+
+  tryCommitPendingPrefill({ ignoreAttachGate = false } = {}) {
+    if (!this.pendingPrefill) return false;
+    if (!this.terminal) return false;
+    if (this.hasOutput) {
+      this.clearPendingPrefill();
+      return false;
+    }
+    if (this.prefillAwaitAttachResult && !ignoreAttachGate) return false;
+    if (!this.isOpen) return false;
+
+    this.prefillCommitted = true;
+    const block = this.pendingPrefill;
+    this.pendingPrefill = null;
+    this.terminal.write(block, () => {
+      this.schedulePreviewCapture(200);
+    });
+    return true;
+  }
+
+  resolvePrefillAfterAttach({ attachedExisting = false } = {}) {
+    if (!this.prefillAwaitAttachResult) return;
+    this.prefillAwaitAttachResult = false;
+    if (attachedExisting) {
+      this.clearPendingPrefill();
+      return;
+    }
+    this.tryCommitPendingPrefill({ ignoreAttachGate: true });
+  }
+
   async initialize(options = {}) {
     const logInit = () => {};
     if (options.initialSettings) {
@@ -991,9 +1026,10 @@ class TerminalManager {
       if (data?.tabId !== this.tabId) return;
       this.hasOutput = true;
       this.lastOutputAt = Date.now();
-      if (!this.isOpen && this.pendingPrefill && !this.prefillCommitted) {
+      if (this.pendingPrefill && !this.prefillCommitted) {
         // PTY出力が先に来た場合はprefillを破棄してちらつきを防ぐ
-        this.pendingPrefill = null;
+        this.prefillAwaitAttachResult = false;
+        this.clearPendingPrefill();
       }
       this.terminal.write(data.data, () => {
         this.schedulePreviewCapture(200);
@@ -1008,6 +1044,7 @@ class TerminalManager {
       }
     });
 
+    const attachExisting = Boolean(options.attachExisting || options.attach);
     const prefill = typeof options.prefill === 'string' ? options.prefill : '';
     const prefillLabel = typeof options.prefillLabel === 'string' ? options.prefillLabel : '';
     if (prefill) {
@@ -1019,19 +1056,19 @@ class TerminalManager {
       if (prefillLabel) {
         block += `${prefillLabel}\r\n`;
       }
-      if (this.isOpen) {
-        this.prefillCommitted = true;
-        this.terminal.write(block, () => {
-          this.schedulePreviewCapture(200);
-        });
-      } else {
-        this.pendingPrefill = block;
+      this.pendingPrefill = block;
+      this.prefillCommitted = false;
+      this.prefillAwaitAttachResult = attachExisting;
+      // attachExisting=false のときは従来どおり即時反映
+      if (!attachExisting) {
+        this.tryCommitPendingPrefill({ ignoreAttachGate: true });
       }
+    } else {
+      this.prefillAwaitAttachResult = false;
     }
 
     // PTY開始 / 既存セッションにアタッチ
     const { cols, rows } = this.terminal;
-    const attachExisting = Boolean(options.attachExisting || options.attach);
     const startCwd = typeof options.startCwd === 'string' ? options.startCwd.trim() : '';
     const profileId = typeof options.profileId === 'string' ? options.profileId.trim() : '';
     this.profileId = profileId || null;
@@ -1067,10 +1104,13 @@ class TerminalManager {
 
     const startPty = async () => {
       logInit('pty:start', { startPayload: startPayload || null });
+      let attachedExisting = false;
       if (attachExisting && window.terminalAPI?.attach) {
         try {
           const result = await window.terminalAPI.attach(this.tabId, cols, rows);
-          if (!result?.success) {
+          if (result?.success) {
+            attachedExisting = true;
+          } else {
             await window.terminalAPI.start(this.tabId, cols, rows, startPayload);
           }
         } catch (_) {
@@ -1079,6 +1119,7 @@ class TerminalManager {
       } else {
         await window.terminalAPI.start(this.tabId, cols, rows, startPayload);
       }
+      return { attachedExisting };
     };
 
     const finalizePtyStart = () => {
@@ -1101,9 +1142,11 @@ class TerminalManager {
     };
 
     const startPromise = (async () => {
-      await startPty();
+      const startInfo = await startPty();
+      this.resolvePrefillAfterAttach({ attachedExisting: Boolean(startInfo?.attachedExisting) });
       finalizePtyStart();
     })().catch((err) => {
+      this.prefillAwaitAttachResult = false;
       if (loadingTimer) {
         clearTimeout(loadingTimer);
         loadingTimer = null;
@@ -1174,14 +1217,10 @@ class TerminalManager {
     setTimeout(() => this.initializeLinkProviders(), 0);
 
     if (this.pendingPrefill && !this.hasOutput) {
-      this.prefillCommitted = true;
-      const block = this.pendingPrefill;
-      this.pendingPrefill = null;
-      this.terminal.write(block, () => {
-        this.schedulePreviewCapture(200);
-      });
-    } else {
-      this.pendingPrefill = null;
+      this.tryCommitPendingPrefill();
+    } else if (this.hasOutput) {
+      this.clearPendingPrefill();
+      this.prefillAwaitAttachResult = false;
     }
   }
 
